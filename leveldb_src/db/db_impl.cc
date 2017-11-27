@@ -881,7 +881,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     }
 
     Slice key = input->key();
-	//lzh: 在处理 key 之前, 是否应该停止当前的 output 的构建/当前 builder 中加入kv .
+	//lzh: 是否应该停止往当前构建的 sst 中增加 key. 若返回 true 则需要将当前的构建写入到磁盘然后再重新开始一个 sst 的构建
 	//lzh: 首次调用 ShouldStopBefore 必然返回 false. 
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != NULL) {
@@ -1015,6 +1015,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
 
+  //lzh: 最终将所有生成的 sst 文件应用到内存版本管理, sst 文件层次管理中
   if (status.ok()) {
     status = InstallCompactionResults(compact);
   }
