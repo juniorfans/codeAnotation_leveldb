@@ -1372,16 +1372,50 @@ bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
 
 /************************************************************************/
 /* 
-	lzh: 在处理 internal_key 之前是否要停止构建 compaction 的输出/即停止 compaction
+	lzh: 
+		函数的使用场景是:	在处理 internal_key 之前是否要停止构建当前 compaction 的输出. (将已经构建好的输出到 sst, 再新起一个构建)
+		实现的细节是:		level+2 层的文件中, 所有 key 都比 internal_key 小(即 largest 比它小)的文件的 size 之和
+								达到了一个阈值, 则函数返回 true. 否则 false
+		
+		函数的作用是:		将与 level+2 层相交较多的 internal_key 尽可能地放入同一个文件. 这可以减少 compaction 后生成的 level+1 文件
+								与 level+2 层文件的相交程度.
+							
+		举例说明, 依次传入: a, b, c, d, e, f, g, h, i, j, 注意它们是递增的顺序, 本函数的返回值和函数调用完之后 grandparent_index_ 的值如下表:
 
-	lzh: grandparents_  文件(level+2层)集合中, 值比在 internal_key 小的文件，加起来的总字节数过多，
-	就需要停止当前的 compaction，因为这将会导致 compact 到 level+1 的 sst 后，level+1 与 level+2 有太多的重叠
+			ShouldStopBefore	|	grandparent_index_		|	含义
+			------------------------------------------------------------------------------------------------------------------
+		a		false						0					a <= f[0].largest
+		b		false						1					f[0].largest < b <= f[1].largest
+		c		true						2					f[1].largest < c <= f[2].largest, c 与文件 f[0]和f[1] 的交集程度大于阈值, 从它开始的 key 应该新起一个 sst 存放
+		d		false						2					c < d <= f[2].largest
+		e		true						3					f[2].largest < e <= f[3].largest, e 与文件 f[2] 的交集程度大于阈值
+		f		true						4					f[3].largest < f <= f[4].largest, f 与文件 f[3] 的交集程度大于阈值
+		g		false						4					g <= f[4].largest
+		h		false						5					f[4].largest < h <= f[5].largest
+		i		false						5					i <= f[5].largest
+		j		true						6					i > f[5].largest, j 与文件 f[4]和f[5] 的交集程度大于阈值
+		
+		上面的例子, 导致的结果是:
+		a, b		---> 1.sst, 与 f[0] 交集较小
+		c, d		---> 2.sst, 与 f[0],f[1] 相交程度大于阈值
+		e			---> 3.sst, 与 f[2] 相交程度大于阈值
+		f, g, h, i	---> 4.sst, 与 f[3] 相交程度大于阈值
+		j			---> 5.sst, 与 f[4],f[5] 相交程度大于阈值
 
-	lzh: 首次调用此函数时 seen_key_ 是 false , 第二次或之后调用时就一直是 true 了. 也即首次调用此函数必返回 false
+		效果很明显, compaction 完成后 1 个 level+1 层的文件与 level+2 层文件相交的总大小是 kMaxGrandParentOverlapBytes.
+		如果 level+2 层文件较小时, 可以与多个 level+2 文件相交, 若较大则只与一个 level+2 文件相交
+		见工程资源图: sst_compaction_should_stop_before
 
-	lzh: grandparent_index_ 的作用在于减少遍历的次数. 因为 ShouldStopBefore 的调用者是以递增的顺序遍历 internal_key的，
-		即传入的 internal_key 越来越大，而遍历 grandparents_ 时判断的是internal_key 是否大于 largest，因此没有必要从最开始的地方遍历 grandparents_ : 
-		它们一定不大于 largest，而应该保留上一次遍历到的地方继续遍历
+	其它的细节:
+		1.首次调用此函数时 seen_key_ 是 false , 也即一定返回 false, 第二次或之后调用时就一直是 true 了, 根据实际情况返回.
+
+		2.grandparent_index_ 表示在 gradparents_ 中遍历的位置, 每次遍历完之后此值会增加. 
+
+		3.kMaxGrandParentOverlapBytes 控制着 compaction 完成后每个 level+1 层文件与 level+2 层文件相交的总文件大小.
+
+		4.overlapped_bytes_ 指的是当前 compaction 过程处于当前构建中的那一个文件(level+1层), 与 level+2 层相交的那些文件, 其总大小.
+			需要注意的是, 每个新开始构建的文件, overlapped_bytes_ 会归 0.
+
 */
 /************************************************************************/
 bool Compaction::ShouldStopBefore(const Slice& internal_key) {

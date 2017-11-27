@@ -716,6 +716,11 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
   return s;
 }
 
+/************************************************************************/
+/* 
+	lzh: 将 compact 中当前的 builder 数据 dump 到磁盘的 sst 文件.
+*/
+/************************************************************************/
 Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
                                           Iterator* input) {
   assert(compact != NULL);
@@ -836,10 +841,10 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(compact->builder == NULL);
   assert(compact->outfile == NULL);
 
-  //lzh: 没有 snapshots_ 的情况下, 当前内存中的最新 sequence 作为 compaton 最小版本号, 这将导致 compation 时所有的 sequence 都比此值小.
+  //lzh: 没有 snapshots_ 的情况下, 当前内存中的最新 sequence 作为 compaton 最小版本号 smallest_snapshot, 这将导致 compation 时所有的 sequence 都比此值小.
   //lzh: 但是本函数还有一个逻辑: 首将遇到的 user_key 不会被 drop, 此后的(即 sequence 较小的)会被 drop
-  //lzh: 若 snapshots_ 不为空, 相当于人工干预上面的逻辑(使最小版本号更小), 强制多留下几个同 user_key 的 internal key, 
-  //lzh: 这刚好就是 snapshot 的功能 -- 提供旧数据的读取
+  //lzh: 若 snapshots_ 不为空, 相当于人工干预使 smallest_snapshot 更小, 效果是同 user_key 将会有多个版本被留下, 不被 drop
+  //lzh: 这刚好就是 snapshot 的功能 -- 可提供旧数据的读取
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
@@ -849,18 +854,19 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   // Release mutex while we're actually doing the compaction work
   mutex_.Unlock();
 
-  //lzh: 得到遍历 compact->compaction 的 Iterator, input
+  //lzh: 得到遍历所有数据的 Iterator. 它将正序遍历所有的 Internalkey, 排序规则是 (user_key 正序比较 --> sequence number 逆序 --> type 的逆序)
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
   input->SeekToFirst();
   Status status;
   ParsedInternalKey ikey;	//当前正遍历到的 internal key
   std::string current_user_key;	//上一个遍历的 user key
 
-  //遍历 input 的过程中是否遇到了 current_user_key (user key 一样, sequence number 不一样), 我们需要 drop 掉比较旧的 ikey
+  //lzh: 遍历 input 的过程中是否遇到了 current_user_key (user key 一样, sequence number 不一样), 我们需要 drop 掉比较旧的 ikey
   bool has_current_user_key = false;
+  //lzh: current_user_key 的上一个版本号 sequence
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
 
-  //遍历 input
+  //lzh: 依次遍历, 若不 drop, 则 compact
   for (; input->Valid() && !shutting_down_.Acquire_Load(); ) {
     // Prioritize immutable compaction work
     if (has_imm_.NoBarrier_Load() != NULL) {
@@ -875,7 +881,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     }
 
     Slice key = input->key();
-	//首次调用 ShouldStopBefore 必然返回 false. 
+	//lzh: 在处理 key 之前, 是否应该停止当前的 output 的构建/当前 builder 中加入kv .
+	//lzh: 首次调用 ShouldStopBefore 必然返回 false. 
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != NULL) {
       status = FinishCompactionOutputFile(compact, input);
