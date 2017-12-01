@@ -95,7 +95,8 @@ class Version {
   class LevelFileNumIterator;
   Iterator* NewConcatenatingIterator(const ReadOptions&, int level) const;
 
-  VersionSet* vset_;            // VersionSet to which this Version belongs //lzh: this 指针所指的 Version 属于哪个 VersionSet 
+  //lzh: this Version 属于哪个 VersionSet 
+  VersionSet* vset_;            // VersionSet to which this Version belongs 
   Version* next_;               // Next version in linked list	//lzh: 下一个
   Version* prev_;               // Previous version in linked list	//lzh: 上一个
   int refs_;                    // Number of live refs to this version

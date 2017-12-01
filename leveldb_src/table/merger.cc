@@ -11,6 +11,14 @@
 namespace leveldb {
 
 namespace {
+
+/************************************************************************/
+/* 
+	lzh: MergingIterator 对外提供 Prev, Next, Seek 接口, 
+		对内的实现是管理着一堆 IteratorWrapper, 通过它们的 Prev, Next, Seek 实现
+		那些功能
+*/
+/************************************************************************/
 class MergingIterator : public Iterator {
  public:
   MergingIterator(const Comparator* comparator, Iterator** children, int n)
@@ -32,6 +40,12 @@ class MergingIterator : public Iterator {
     return (current_ != NULL);
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 迭代器 seek 到 first 位置: 需要将那一堆 WrapperIterator 全部 seek 到 first 位置
+	并且通过比较这 n_ 个迭代器 first 位置的值, 找到最小的迭代器, 让 current_ 指向它
+  */
+  /************************************************************************/
   virtual void SeekToFirst() {
     for (int i = 0; i < n_; i++) {
       children_[i].SeekToFirst();
@@ -40,6 +54,7 @@ class MergingIterator : public Iterator {
     direction_ = kForward;
   }
 
+  //lzh: 同 SeektoFirst
   virtual void SeekToLast() {
     for (int i = 0; i < n_; i++) {
       children_[i].SeekToLast();
@@ -48,6 +63,12 @@ class MergingIterator : public Iterator {
     direction_ = kReverse;
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 在各个迭代器中 seek 到 target 的位置, 然后比较这 n_ 个位置的值, 
+	找到最小的, 让 current_ 指向那个迭代器
+  */
+  /************************************************************************/
   virtual void Seek(const Slice& target) {
     for (int i = 0; i < n_; i++) {
       children_[i].Seek(target);
@@ -56,6 +77,19 @@ class MergingIterator : public Iterator {
     direction_ = kForward;
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 分两种情况
+		1.	若上一次遍历的方向是 kForward, 即与本函数需要的遍历方向
+			一致, 则只需要将 迭代器 current_ 下一个元素 next 与其它迭代器各自指
+			的位置的值进行比较, 找到最小的, 即是整组迭代器的 Next.
+		2.	若上一次遍历的方向是 kReverse, 与本次要遍历方向相反, kReverse 遍历
+			时, 要往前找到最大的元素, 这样就会造成遍历结束后, 所有的迭代器都会指在
+			较大的位置, 这与 kForward 的逻辑明显不一样. 解决方法是对于非 current_ 迭代器
+			seek 到各自 current_.key 对应的位置. 再对所有的迭代器各自所指位置值找到最小的, 即是
+			整组迭代器的 Next.
+  */
+  /************************************************************************/
   virtual void Next() {
     assert(Valid());
 
@@ -82,6 +116,19 @@ class MergingIterator : public Iterator {
     FindSmallest();
   }
 
+  /************************************************************************/
+  /* 
+  lzh: 与 Next 类似, 分两种情况
+	  1.	若上一次遍历的方向是 kReverse, 即与本函数需要的遍历方向
+	  一致, 则只需要将 迭代器 current_ 下一个元素 prev 与其它迭代器各自指
+	  的位置的值进行比较, 找到最大的, 即是整组迭代器的 Prev.
+	  2.	若上一次遍历的方向是 kForward, 与本次要遍历方向相反, kForward 遍历
+	  时, 要往后找到最小的元素, 这样就会造成遍历结束后, 所有的迭代器都会指在
+	  较小的位置, 这与 kReverse 的逻辑明显不一样. 解决方法是对于非 current_ 迭代器
+	  seek 到各自 current_.key 对应的位置. 再对所有的迭代器各自所指位置值找到最大的, 即是
+	  整组迭代器的 Next.
+  */
+  /************************************************************************/
   virtual void Prev() {
     assert(Valid());
 
@@ -140,8 +187,12 @@ class MergingIterator : public Iterator {
   // For now we use a simple array since we expect a very small number
   // of children in leveldb.
   const Comparator* comparator_;
-  IteratorWrapper* children_;
+
+  //lzh: 共计 n_ 个 IteratorWrapper 对象, children_[i] 指第 i 个 IteratorWrapper 对象
+  IteratorWrapper* children_;	
   int n_;
+
+  //lzh: 指向当前正在被使用的那个 IteratorWrapper 对象的指针
   IteratorWrapper* current_;
 
   // Which direction is the iterator moving?
@@ -152,6 +203,11 @@ class MergingIterator : public Iterator {
   Direction direction_;
 };
 
+/************************************************************************/
+/* 
+	lzh: 定位到最小的
+*/
+/************************************************************************/
 void MergingIterator::FindSmallest() {
   IteratorWrapper* smallest = NULL;
   for (int i = 0; i < n_; i++) {
@@ -167,6 +223,11 @@ void MergingIterator::FindSmallest() {
   current_ = smallest;
 }
 
+/************************************************************************/
+/* 
+	lzh: 定位到最大的
+*/
+/************************************************************************/
 void MergingIterator::FindLargest() {
   IteratorWrapper* largest = NULL;
   for (int i = n_-1; i >= 0; i--) {
