@@ -166,10 +166,22 @@ class Version::LevelFileNumIterator : public Iterator {
       index_--;
     }
   }
+
+  /************************************************************************/
+  /* 
+	lzh: 返回当前位置文件的 largest
+  */
+  /************************************************************************/
   Slice key() const {
     assert(Valid());
     return (*flist_)[index_]->largest.Encode();
   }
+
+  /************************************************************************/
+  /* 
+	lzh: 返回当前位置文件的 number, size 的固长编码
+  */
+  /************************************************************************/
   Slice value() const {
     assert(Valid());
     EncodeFixed64(value_buf_, (*flist_)[index_]->number);
@@ -186,6 +198,15 @@ class Version::LevelFileNumIterator : public Iterator {
   mutable char value_buf_[16];
 };
 
+
+/************************************************************************/
+/* 
+	lzh: 根据 table 缓存 arg 和文件信息 file_value (file number, file size) 生成迭代器. 
+	若 arg 中没有缓存此文件, 则打开文件加入到缓存同时返回此文件的迭代器.
+
+	注意此函数的 file_value 参数正好与迭代器 LevelFileNumIterator 的 value 一致
+*/
+/************************************************************************/
 static Iterator* GetFileIterator(void* arg,
                                  const ReadOptions& options,
                                  const Slice& file_value) {
@@ -194,12 +215,21 @@ static Iterator* GetFileIterator(void* arg,
     return NewErrorIterator(
         Status::Corruption("FileReader invoked with unexpected value"));
   } else {
-    return cache->NewIterator(options,
-                              DecodeFixed64(file_value.data()),
-                              DecodeFixed64(file_value.data() + 8));
+    return cache->NewIterator(options,	
+                              DecodeFixed64(file_value.data()),		//lzh: file number
+                              DecodeFixed64(file_value.data() + 8)	//lzh: file size
+																	//lzh: 第四个参数(用来接收打开的 table 的指针)默认值为 NULL
+							  );
   }
 }
 
+/************************************************************************/
+/* 
+	lzh: 生成访问第 level 层的文件的迭代器.	它是一个二维的迭代器；
+	第(1)维的 LevelFileNumIterator 迭代器是 文件上 的迭代器, 返回的是一个文件的信息(file number, file size), 
+	第(2)维的 TableCache 的 Iterator 是 TableCache 上的迭代器, 用于访问数据
+*/
+/************************************************************************/
 Iterator* Version::NewConcatenatingIterator(const ReadOptions& options,
                                             int level) const {
   return NewTwoLevelIterator(

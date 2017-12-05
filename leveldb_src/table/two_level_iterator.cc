@@ -15,6 +15,15 @@ namespace {
 
 typedef Iterator* (*BlockFunction)(void*, const ReadOptions&, const Slice&);
 
+
+/************************************************************************/
+/* 
+lzh:	TwoLevelIterator 是一个二维的迭代器. 即 TwoLevelIterator 的 value 是另一个
+		迭代器对象的指针.关联想像二维指针即可明白.
+
+		这样设计的根本原因是, table 文件/sst 文件的格式是, 
+*/
+/************************************************************************/
 class TwoLevelIterator: public Iterator {
  public:
   TwoLevelIterator(
@@ -153,6 +162,13 @@ void TwoLevelIterator::SetDataIterator(Iterator* data_iter) {
   data_iter_.Set(data_iter);
 }
 
+
+/************************************************************************/
+/* 
+	lzh: 此函数在该迭代器的所有 Seek 系列方法中被调用, 
+	注意当前迭代器 TwoLevelIterator 的值是 data_iter_ 迭代器中的索引
+*/
+/************************************************************************/
 void TwoLevelIterator::InitDataBlock() {
   if (!index_iter_.Valid()) {
     SetDataIterator(NULL);
@@ -162,7 +178,14 @@ void TwoLevelIterator::InitDataBlock() {
       // data_iter_ is already constructed with this iterator, so
       // no need to change anything
     } else {
-      Iterator* iter = (*block_function_)(arg_, options_, handle);
+
+      Iterator* iter	//lzh: 
+		  = 
+		  (*block_function_)(
+		  arg_,			//lzh: table 
+		  options_,		//lzh: read option (block cache 挂在 option 中)
+		  handle		//lzh: handle 即是元素在 talbe 中的位置信息
+		  );
       data_block_handle_.assign(handle.data(), handle.size());
       SetDataIterator(iter);
     }

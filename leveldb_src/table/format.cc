@@ -25,6 +25,11 @@ void BlockHandle::EncodeTo(std::string* dst) const {
   PutVarint64(dst, size_);
 }
 
+/************************************************************************/
+/* 
+	lzh: 将 input 解码, 得到 offset_ 和 size_ 
+*/
+/************************************************************************/
 Status BlockHandle::DecodeFrom(Slice* input) {
   if (GetVarint64(input, &offset_) &&
       GetVarint64(input, &size_)) {

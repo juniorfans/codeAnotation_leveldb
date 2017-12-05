@@ -55,6 +55,7 @@ Status Table::Open(const Options& options,
   if (s.ok()) {
     // We've successfully read the footer and the index block: we're
     // ready to serve requests.
+	  // lzh: 每一个 Table 有一个 Rep, 有一个 cache, 有一个 index block
     Rep* rep = new Table::Rep;
     rep->options = options;
     rep->file = file;
@@ -73,6 +74,11 @@ Table::~Table() {
   delete rep_;
 }
 
+/************************************************************************/
+/* 
+	lzh: 直接删除 arg 指示的 Block
+*/
+/************************************************************************/
 static void DeleteBlock(void* arg, void* ignored) {
   delete reinterpret_cast<Block*>(arg);
 }
@@ -82,6 +88,11 @@ static void DeleteCachedBlock(const Slice& key, void* value) {
   delete block;
 }
 
+/************************************************************************/
+/* 
+	lzh: 释放缓存 arg 中的 条目 h. Release 当缓存条目引用计数为 0 时会清理内存
+*/
+/************************************************************************/
 static void ReleaseBlock(void* arg, void* h) {
   Cache* cache = reinterpret_cast<Cache*>(arg);
   Cache::Handle* handle = reinterpret_cast<Cache::Handle*>(h);
@@ -90,14 +101,25 @@ static void ReleaseBlock(void* arg, void* h) {
 
 // Convert an index iterator value (i.e., an encoded BlockHandle)
 // into an iterator over the contents of the corresponding block.
+/************************************************************************/
+/* 
+	lzh: 返回 Table 中 index_value 位置的 Block 的迭代器. 
+	1.	如果此 Table 具有块缓存 block_cache 则块缓存中读取, 如果块缓存中没有该数据则从 table 文件(sst 文件)
+		中读取并加入到块缓存中(注意注册 ReleaseBlock 函数).
+	2.	如果此 Table 无块缓存则直接读取 table 文件, 注册 DeleteBlock 函数
+*/
+/************************************************************************/
 Iterator* Table::BlockReader(void* arg,
                              const ReadOptions& options,
                              const Slice& index_value) {
   Table* table = reinterpret_cast<Table*>(arg);
   Cache* block_cache = table->rep_->options.block_cache;
   Block* block = NULL;
+
+  //lzh: table 中 index_value 元素, 在缓存中的位置信息
   Cache::Handle* cache_handle = NULL;
 
+  //lzh: 与 index_value 一样, handle 是 Table 中的索引信息(offset, size)
   BlockHandle handle;
   Slice input = index_value;
   Status s = handle.DecodeFrom(&input);
@@ -106,21 +128,29 @@ Iterator* Table::BlockReader(void* arg,
 
   if (s.ok()) {
     if (block_cache != NULL) {
+		//lzh: 计算 Table 中索引 handle 指示的元素在缓存 block_cache 中的索引数据
       char cache_key_buffer[16];
       EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
       EncodeFixed64(cache_key_buffer+8, handle.offset());
       Slice key(cache_key_buffer, sizeof(cache_key_buffer));
+
+	  //lzh: key 即是指定元素在缓存 block_cache 中对应的索引信息
       cache_handle = block_cache->Lookup(key);
       if (cache_handle != NULL) {
+		  //lzh: 位置信息有效则查看此位置的值. 实际上就是 ((LRUHandle*)cache_handle)->value
         block = reinterpret_cast<Block*>(block_cache->Value(cache_handle));
       } else {
+		  //lzh: 缓存无效, 则读取 table 中 handle 位置的数据(注意 handle 即等价于 index_value), 装入 block
         s = ReadBlock(table->rep_->file, options, handle, &block);
+
+		//插入缓存
         if (s.ok() && options.fill_cache) {
           cache_handle = block_cache->Insert(
               key, block, block->size(), &DeleteCachedBlock);
         }
       }
     } else {
+		//lzh: block_cache 是 NULl 不需要将当前 block 加入进去
       s = ReadBlock(table->rep_->file, options, handle, &block);
     }
   }
@@ -131,6 +161,7 @@ Iterator* Table::BlockReader(void* arg,
     if (cache_handle == NULL) {
       iter->RegisterCleanup(&DeleteBlock, block, NULL);
     } else {
+		//lzh: cache 具有引用计数, 所以使用 release 的方式
       iter->RegisterCleanup(&ReleaseBlock, block_cache, cache_handle);
     }
   } else {
@@ -139,10 +170,20 @@ Iterator* Table::BlockReader(void* arg,
   return iter;
 }
 
+
+/************************************************************************/
+/* 
+	lzh: 返回一个遍历此 Table 的迭代器.
+	第一维的迭代器是 index_block 的迭代器，用于返回元素在 table 中的位置信息.
+	第二维的迭代器是 table 上的迭代器，用于返回元素的 key-value.
+*/
+/************************************************************************/
 Iterator* Table::NewIterator(const ReadOptions& options) const {
   return NewTwoLevelIterator(
-      rep_->index_block->NewIterator(rep_->options.comparator),
-      &Table::BlockReader, const_cast<Table*>(this), options);
+      rep_->index_block->NewIterator(rep_->options.comparator),	//lzh: table 的 index_block
+      &Table::BlockReader, 
+	  const_cast<Table*>(this), 
+	  options);
 }
 
 uint64_t Table::ApproximateOffsetOf(const Slice& key) const {

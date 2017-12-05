@@ -28,7 +28,7 @@ struct LRUHandle {
   LRUHandle* next_hash;
   LRUHandle* next;
   LRUHandle* prev;
-  size_t charge;      // TODO(opt): Only allow uint32_t?
+  size_t charge;      // TODO(opt): Only allow uint32_t?	//lzh: 占用空间大小
   size_t key_length;
   uint32_t refs;
   uint32_t hash;      // Hash of key(); used for fast sharding and comparisons
