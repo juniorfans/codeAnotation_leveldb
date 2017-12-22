@@ -71,13 +71,23 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
 class Block::Iter : public Iterator {
  private:
   const Comparator* const comparator_;
+
+  //lzh: 所在的 block 
   const char* const data_;      // underlying block contents
+
+  //lzh: restart array 存储的是 restart number 数组, 固长编码. restarts_ 即是这个数组起始地址相对 data_ 的偏移
   uint32_t const restarts_;     // Offset of restart array (list of fixed32)
+
+  //lzh: 总共有多少个 restart number
   uint32_t const num_restarts_; // Number of uint32_t entries in restart array
 
   // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
+  //lzh: 当前 entry 在它的块中(data_)的偏移量
   uint32_t current_;
+
+  //lzh: current_ entry 所在组的下标，即当前 entry 的 restart 索引号
   uint32_t restart_index_;  // Index of restart block in which current_ falls
+
   std::string key_;
   Slice value_;
   Status status_;
@@ -87,15 +97,23 @@ class Block::Iter : public Iterator {
   }
 
   // Return the offset in data_ just past the end of the current entry.
+  //lzh: 由当前 entry 的最后一个元素 value 及长度计算下一个 entry 的开始位置
+  //lzh: 下一个 entry 的偏移. entry 的最后一部分是 value_data, 所以计算下一个 entry 的偏移可以按下面的方法计算
   inline uint32_t NextEntryOffset() const {
     return (value_.data() + value_.size()) - data_;
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 获得第 index 个组的偏移，这个值即是 restarts 数组的第 index 个元素的值
+  */
+  /************************************************************************/
   uint32_t GetRestartPoint(uint32_t index) {
     assert(index < num_restarts_);
-    return DecodeFixed32(data_ + restarts_ + index * sizeof(uint32_t));
+    return DecodeFixed32(data_ + restarts_ + index * sizeof(uint32_t));//restarts_ 是 restarts 数组起始地址相对 data_ 的偏移
   }
 
+  //lzh: 指向索引为 index 的 restart 位置. 注意此时 key_ 和 value_ 都要清空
   void SeekToRestartPoint(uint32_t index) {
     key_.clear();
     restart_index_ = index;
@@ -136,30 +154,52 @@ class Block::Iter : public Iterator {
     ParseNextKey();
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 若当前已经是第一个 entry 了，再调用 Prev 则会到失效的位置
+  */
+  /************************************************************************/
   virtual void Prev() {
     assert(Valid());
 
     // Scan backwards to a restart point before current_
     const uint32_t original = current_;
+	
+	//lzh: [疑问] 这里为什么要用循环呢？是不是将 while 换成 if 即可?
+	//lzh: 获得小于 original 的最大的重启点/组位置，换种说法就是找到 original 所在的那个组
     while (GetRestartPoint(restart_index_) >= original) {
       if (restart_index_ == 0) {
+		  //lzh: GetRestartPoint(0) >= original，表示第 0 个重启点的位置大于当前 entry 位置
+		  //lzh: 即说明当前是第0个 entry，此时也必有 GetRestartPoint(0) == original
+		  //lzh: 说明当前迭代器处于第0个位置, 再往前则跳到最未的失效位置
         // No more entries
+
+		//lzh: current_ 指向 restarts 数组位置, 即第一个非 entry 字节的位置, 此时 Valid() 函数将返回 false
         current_ = restarts_;
+		//lzh: 首个失效的 restart 数组下标（有效范围是 0 ~ num_restarts_-1）之后只要调用 GetRestartPoint 则会 assert 失败
         restart_index_ = num_restarts_;
         return;
       }
       restart_index_--;
     }
 
+	//lzh: 找到了 original 所使用的那个重启点: 第 restart_index_ 个重启点.
+	//lzh: 从第 restart_index_ 个重启点指示的那个 entry 开始往后遍历直到遇到 original，此时刚好将 original 整个 key 复原出来
     SeekToRestartPoint(restart_index_);
     do {
       // Loop until end of current entry hits the start of original entry
     } while (ParseNextKey() && NextEntryOffset() < original);
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 定位到最后一个比 target 小的 entry，(即小于 target 的最大的 entry)
+  */
+  /************************************************************************/
   virtual void Seek(const Slice& target) {
     // Binary search in restart array to find the first restart point
     // with a key >= target
+	  //lzh: 使用二分法找到那个仅小于 target 的重启点
     uint32_t left = 0;
     uint32_t right = num_restarts_ - 1;
     while (left < right) {
@@ -198,12 +238,17 @@ class Block::Iter : public Iterator {
   }
 
   virtual void SeekToFirst() {
+	  //lzh: 直接定位到第一个组的位置，即是该 Block 的首个 entry 位置
     SeekToRestartPoint(0);
     ParseNextKey();
   }
 
   virtual void SeekToLast() {
-    SeekToRestartPoint(num_restarts_ - 1);
+    //lzh: 定位到最后一个组的位置
+	SeekToRestartPoint(num_restarts_ - 1);
+	
+	//lzh: 遍历这个组找到最后一个 entry。
+	//lzh: 注意最后一个组的最后一个 entry 也即整个 Block 的最后一个 entry 它的后面即是 restarts，这里判断不要过界了
     while (ParseNextKey() && NextEntryOffset() < restarts_) {
       // Keep skipping
     }
@@ -218,9 +263,19 @@ class Block::Iter : public Iterator {
     value_.clear();
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 
+	1.通过当前 entry 的 value_data 位置和 value_data 的长度可以算出下一个 entry的起始位置。
+	2.解析下一个 entry 的字节流，将其结构化，算出 entry 中的各个字段之值。
+	3.最后再计算出这个 entry 所在的组的下标
+  */
+  /************************************************************************/
   bool ParseNextKey() {
     current_ = NextEntryOffset();
     const char* p = data_ + current_;
+
+	//lzh: 所有 entry 排布完, 后面排的是 restarts_ 数组.
     const char* limit = data_ + restarts_;  // Restarts come right after data
     if (p >= limit) {
       // No more entries to return.  Mark as invalid.
@@ -231,14 +286,23 @@ class Block::Iter : public Iterator {
 
     // Decode next entry
     uint32_t shared, non_shared, value_length;
+	//lzh: 解析当前 entry, 解析完之后，p 指向当前 entry 的 unshared_key_data
     p = DecodeEntry(p, limit, &shared, &non_shared, &value_length);
+	//lzh: 如上, 这不可能为 NULL，shared 是当前 entry 的键与前一个 entry 的键 key_ 的相同前缀的长度, 所以必然小于 key_ 长度
     if (p == NULL || key_.size() < shared) {
       CorruptionError();
       return false;
     } else {
+		//lzh: key_ 是上一个 entry 的键，此处相当于让 key_ 只保留与后一个 entry 共同的前缀
       key_.resize(shared);
+	  //lzh: 再加上当前 entry 键中不共同的部分, key_ 即变成了当前 entry 的键
       key_.append(p, non_shared);
+	  //lzh: p+non_shared 即指向了当前 entry 的 value_data
       value_ = Slice(p + non_shared, value_length);
+
+	  //lzh: restart_index_ 目前指向的是上一个 entry 所在的组的下标，现在需要调整。
+	  //lzh: 考虑到本函数的调用场景有可能跨越多个 entry: 如 SeekToFirst, SeekToLast
+	  //lzh: 所以新的位置可能需要跨越多个组，因此下面使用了一个循环去跨越组，直到定位到当前 entry 所在的组，也即 restart_index
       while (restart_index_ + 1 < num_restarts_ &&
              GetRestartPoint(restart_index_ + 1) < current_) {
         ++restart_index_;

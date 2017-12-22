@@ -16,7 +16,8 @@ namespace leveldb {
 
 /************************************************************************/
 /* 
-	lzh: 遍历 iter 将 kv 对写入到 sst 文件中
+	lzh: 遍历 iter 将 kv 对写入到 sst 文件中, 文件名信息由 meta 给出
+	写入完成后将这些 kv 对写入到 table_cache 中
 */
 /************************************************************************/
 Status BuildTable(const std::string& dbname,
@@ -72,6 +73,7 @@ Status BuildTable(const std::string& dbname,
 
     if (s.ok()) {
       // Verify that the table is usable
+	  // 将 meta->number 的数据加入到 table_cache 里面
       Iterator* it = table_cache->NewIterator(ReadOptions(),
                                               meta->number,
                                               meta->file_size);

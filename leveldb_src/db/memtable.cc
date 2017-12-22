@@ -121,10 +121,13 @@ p += key_size;									//调整 buf 紧贴的后续字节的地址
 }
 
 bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) {
+
+	//lzh:  memtable 中 key 格式是: userkey_len, userkey_data, SequnceNumber拼接ValueType
   Slice memkey = key.memtable_key();
   Table::Iterator iter(&table_);
 
-  //lzh: 首个不小于 memkey 的节点
+  //lzh: 首个不小于 memkey 的节点. 注意 排序规则是 user_key 增序, seuenceNumber 降序, type 降序
+  //lzh: 所以找到的是最新的版本
   iter.Seek(memkey.data());
   if (iter.Valid()) {
     // entry format is:
@@ -137,10 +140,11 @@ bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) {
     // sequence number since the Seek() call above should have skipped
     // all entries with overly large sequence numbers.
 
-    const char* entry = iter.key();//lzh: skiplist 里面存储的 key，它将所有的信息都存储进去，包括 sequencenum , type
+	//lzh: skiplist 里面存储的 key, 是 InternalKey ( user_key, sequencenum , type)
+    const char* entry = iter.key();
     uint32_t key_length;
 
-	//lzh: 前面几个字节(最多四个)存储着 key 的变长编码，它的值被放入 key_length
+	//lzh: 前面几个字节(最多四个, 所以 limit 传入  entry+5)存储着 key 的变长编码，它的值被放入 key_length
 	//lzh: key_length 指示了 entry 后面紧接着存放的 userkey 的长度
 	//lzh: key_ptr 是 key_length 变长编码的结束(exclusive)，也即 userkey 的起始位置
 	const char* key_ptr = GetVarint32Ptr(entry, entry+5, &key_length);	

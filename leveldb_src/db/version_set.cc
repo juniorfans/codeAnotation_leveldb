@@ -78,12 +78,10 @@ Version::~Version() {
 /************************************************************************/
 /* 
 	lzh: 使用二分法找出 files(正序排列) 中首个 largest >= key 的 file
-	注意边界条件，举例说明
-	若 files[0].min > key 则返回 0, 逻辑上是正确的
-	若 files[0].largest < key 则返回 files.size()，表示没有找到.
-	因此该函数的返回值这样去描述：
-	返回找到 files 中首个 largest 大于 key 的 index. 若不存在则返回 files.size()
-	
+	注意边界条件
+		1.若 files[0].smallest > key 则返回 0
+		2.若 files[files.size()-1].largest < key 则返回 files.size()
+	调用者若想调用此函数返回 key 所在的文件，则需要注意第 1 种情况可能是个反例
 */
 /************************************************************************/
 int FindFile(const InternalKeyComparator& icmp,
@@ -123,7 +121,8 @@ bool SomeFileOverlapsRange(
   InternalKey small(smallest_user_key, kMaxSequenceNumber, kValueTypeForSeek);
 
   //lzh: 从 files 中找到首个 largest_key 大于 small 的 file
-  //lzh: 注意当 files 的最大 key 小于 small 时，index 的值为 files.size(). 后面会判断这一结果为不相交
+  //lzh: 注意当 files[files.size()-1].largest < small 时，index 的值为 files.size(). 后面通过 index<files.size() 判断这一结果为不相交
+  //lzh: 同时当 files[0].smallest > small 时，index 的值是 0，后面通过  icmp.user_comparator()->Compare 判断这一结果为不相交
   const uint32_t index = FindFile(icmp, files, small.Encode());
 
   return ((index < files.size()) &&
@@ -147,6 +146,15 @@ class Version::LevelFileNumIterator : public Iterator {
   virtual bool Valid() const {
     return index_ < flist_->size();
   }
+
+  /************************************************************************/
+  /* 
+	lzh:
+	返回首个 largest 比 target 的文件.
+	若 target < flist_[0].smallest 则返回 0，该情况下表示 target 可能在 flist_[0] 中或者不在
+	若 target > flist_[flist_->size()-1] 则返回 flist_->size()，无效的位置
+  */
+  /************************************************************************/
   virtual void Seek(const Slice& target) {
     index_ = FindFile(icmp_, *flist_, target);
   }
@@ -179,7 +187,7 @@ class Version::LevelFileNumIterator : public Iterator {
 
   /************************************************************************/
   /* 
-	lzh: 返回当前位置文件的 number, size 的固长编码
+	lzh: 返回当前文件的 number, size 的固长编码
   */
   /************************************************************************/
   Slice value() const {
@@ -226,7 +234,7 @@ static Iterator* GetFileIterator(void* arg,
 /************************************************************************/
 /* 
 	lzh: 生成访问第 level 层的文件的迭代器.	它是一个二维的迭代器；
-	第(1)维的 LevelFileNumIterator 迭代器是 文件上 的迭代器, 返回的是一个文件的信息(file number, file size), 
+	第(1)维的 LevelFileNumIterator 迭代器是第 level 层文件列表的迭代器, 返回的单个文件{(file number, file size)}
 	第(2)维的 TableCache 的 Iterator 是 TableCache 上的迭代器, 用于访问数据
 */
 /************************************************************************/
@@ -290,6 +298,20 @@ static bool NewestFirst(FileMetaData* a, FileMetaData* b) {
   return a->number > b->number;
 }
 
+
+/************************************************************************/
+/* 
+	lzh: 从缓存中, 或磁盘上的 sst 文件查找键 k 
+	步骤:
+		1.	对于第 0 层文件, 由于这些文件是无序的(文件之键的区间有重叠), 因此遍历这些文件, 
+			选出键区间包含 k 的文件, 加入后续查找的列表
+			对于非第 0 层文件, 由于文件严格递增序, 使用二分法查找包含 k 的文件(有且只有一个), 加入后续查找的列表
+		
+		2.	对于待查找文件列表, 在 table 缓存(vset_->table_cache_) 中查找每一个文件中是否包含 k(若缓存中没有此文件则打开并加入到缓存)
+
+	Get 函数还有另外一个功能: 若查找过程中对多于一个文件进行了 seek, 则需要记录第二个 seek 的文件, 用于后续的 compaction, 以提高后面查询的效率
+*/
+/************************************************************************/
 Status Version::Get(const ReadOptions& options,
                     const LookupKey& k,
                     std::string* value,
@@ -314,13 +336,19 @@ Status Version::Get(const ReadOptions& options,
     if (num_files == 0) continue;
 
     // Get the list of files to search in this level
+	//lzh: files_[level] 是第 level 层的文件列表: vector<FileMetaData*>, &files_[level][0] 指的即是第 0 个元素的地址
+	//lzh: 但注意它又同时可以看成是数组的首地址.
+	//lzh: files 与 num_files 这两个变量一起配合, 指示了要找的元素可能在 从 files 地址开始的 num_files 个文件中.
     FileMetaData* const* files = &files_[level][0];
     if (level == 0) {
       // Level-0 files may overlap each other.  Find all files that
       // overlap user_key and process them in order from newest to oldest.
       tmp.reserve(num_files);
       for (uint32_t i = 0; i < num_files; i++) {
+
+		  //lzh: files 是首地址(vector 是连续的内存地址), 所以 files[i] 表示第 i 个元素
         FileMetaData* f = files[i];
+		//lzh: 如果 user_key 可能出现在 f 文件中 smallest <= user_key <= largest
         if (ucmp->Compare(user_key, f->smallest.user_key()) >= 0 &&
             ucmp->Compare(user_key, f->largest.user_key()) <= 0) {
           tmp.push_back(f);
@@ -328,11 +356,14 @@ Status Version::Get(const ReadOptions& options,
       }
       if (tmp.empty()) continue;
 
+	  //lzh: 对 tmp 中的文件排序, 依据是文件的 number
       std::sort(tmp.begin(), tmp.end(), NewestFirst);
       files = &tmp[0];
       num_files = tmp.size();
     } else {
       // Binary search to find earliest index whose largest key >= ikey.
+		//lzh: 使用二分法找出 files(正序排列) 中首个 largest >= key 的 file
+		//lzh: 之所以要进行下面两个判断，参考 FindFile 注释
       uint32_t index = FindFile(vset_->icmp_, files_[level], ikey);
       if (index >= num_files) {
         files = NULL;
@@ -350,9 +381,17 @@ Status Version::Get(const ReadOptions& options,
       }
     }
 
-    for (uint32_t i = 0; i < num_files; ++i) {
+	//lzh: 要找的元素可能在 从 files 地址开始的 num_files 个文件中.
+    for (uint32_t i = 0; i < num_files; ++i) 
+	{
+		//lzh: 在 seek 过程中, 若只是经过一个文件, 并没有在此文件中命中, 还要继续在其它文件中查找, 则此文件需要被记录下来, 用于后续的 compact, 
+		//lzh: 这样做的依据是: 在查找元素时，此文件以“被经过但不命中”的方式多次访问, 次数多达 allowed_seeks 次, 
+		//lzh: 那么说明此块对于全局的查找构成阻碍已经到达了一个程度, 此文件需要被"消灭" -- compaction 到更高层
+		//lzh: 背后更深层次的原因是, 此文件太稀疏了: 文件的区间(smallest--largest)太大了, 很多查找的键落在此范围但不被命中
+		//lzh: 这会造成查找的效率低下，那么此文件应该被整理，直接填充到上一 level 文件, 使上一 level 文件更稠密.
       if (last_file_read != NULL && stats->seek_file == NULL) {
         // We have had more than one seek for this read.  Charge the 1st file.
+		  //lzh: 当前是第二次遍历, 说明前一次遍历的文件没有命中. 我们需要记录第一次遍历的那个文件
         stats->seek_file = last_file_read;
         stats->seek_file_level = last_file_read_level;
       }
@@ -361,6 +400,7 @@ Status Version::Get(const ReadOptions& options,
       last_file_read = f;
       last_file_read_level = level;
 
+	  //lzh: 若 table_cache 中没有 f->number 的缓存则在 NewIterator 函数中打开并缓存
       Iterator* iter = vset_->table_cache_->NewIterator(
           options,
           f->number,
@@ -545,6 +585,11 @@ class VersionSet::Builder {
       // same as the compaction of 40KB of data.  We are a little
       // conservative and allow approximately one seek for every 16KB
       // of data before triggering a compaction.
+	  //lzh: 1.	读/写 1M 数据花费 10ms, compact 1M 数据总共涉及到 20多M 数据读/写, 预计花费时间是 250ms
+	  //lzh:	(从 level-n 读1M, level-n+1 读10M, level-n+1 写10M. 以上是因为 n+1 层大小是 n 层的 10 倍左右)
+	  //lzh: 2.	假设一次 seek 花费的时间也是 10ms
+	  //lzh: 3.	综合 1,2, 则 25 次 seek 花费的时间与 compact 1M 数据一样, 1 次 seek 花费时间即是 compact 40KB 相同.
+	  //lzh: 假设一个文件总大小是 n, 则将它 compact 的耗费等价于 n/40 次的 seek. 保守一点, 设置为 n/16
       f->allowed_seeks = (f->file_size / 16384);
       if (f->allowed_seeks < 100) f->allowed_seeks = 100;
 
@@ -1141,8 +1186,12 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
   // TODO(opt): use concatenating iterator for level-0 if there is no overlap
-  // lzh: 非第 0 层文件总是有两个文件集合要 compact. c[0], c[1]
-  const int space = (c->level() == 0 ? c->inputs_[0].size() + 1 : 2);
+ 
+  const int space = (c->level() == 0 ? 
+		c->inputs_[0].size() + 1	// lzh: 0 层的文件可能相互重叠所以它们每个都需要包装为 Iterator, 另外第 1 层所有文件需要包装为一个 NewTwoLevelIterator
+	  : 
+		2							// lzh: 非第 0 层文件总是有两个文件集合要 compact. c[0], c[1]
+	  );
   Iterator** list = new Iterator*[space];
   int num = 0;
   for (int which = 0; which < 2; which++) {
@@ -1163,18 +1212,39 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
     }
   }
   assert(num <= space);
+
+  //lzh: 将所有的 Iterator 包装为一个
   Iterator* result = NewMergingIterator(&icmp_, list, num);
   delete[] list;
   return result;
 }
 
+/************************************************************************/
+/* 
+	lzh:	
+		要点1:
+			leveldb 提供了两种触发 compaction 的条件/方式:
+			size_compaction: 基于文件大小触发的 compaction. 这样做的动机是 leveldb 的层次控制: 高层的文件比低层的要大, 约 10 倍
+
+			seek_compaction:	基于文件“被经过但不命中”的次数达到阈值触发的 compaction. 
+								这样做的动机是消灭稀疏的文件, 将它放入更高层的文件中, 提高文件的稠密度提高查询效率.
+								文件太稀疏了: 文件的区间(smallest--largest)太大了, 含有的 kv 对只有那么多, 很多查找的键落在此范围但不被命中
+								这会形成查找的阻碍，将此文件填充到高一层文件中, 提高查询效率
+		要点2:		
+			c->inputs_[0] 是 level 层需要 compact 的文件集合
+			c->inputs_[1] 是 level+1 层需要 compact 的文件集合
+*/
+/************************************************************************/
 Compaction* VersionSet::PickCompaction() {
   Compaction* c;
   int level;
 
   // We prefer compactions triggered by too much data in a level over
   // the compactions triggered by seeks.
+  //lzh; 优先执行 size_compaction
   const bool size_compaction = (current_->compaction_score_ >= 1);
+
+  //lzh: 在 db->Get 中若对多于一个的 sst 文件/缓存 seek 的次数过多, 则  current_->file_to_compact_ 会被设置
   const bool seek_compaction = (current_->file_to_compact_ != NULL);
   if (size_compaction) {
     level = current_->compaction_level_;
@@ -1188,14 +1258,16 @@ Compaction* VersionSet::PickCompaction() {
 	//lzh: 下一次触发自动Compaction会从这个Key开始。容量触发的优先级高于下面将要提到的Seek触发。
     for (size_t i = 0; i < current_->files_[level].size(); i++) {
       FileMetaData* f = current_->files_[level][i];
-      if (compact_pointer_[level].empty() ||
-
-		  //lzh: 当前文件的 largest 大于上次 level 层 compact 之后的最大值
-          icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {
+      if (compact_pointer_[level].empty() ||		//lzh: 本层 compact_pointer_ 以前的文件都已经被 compact 过
+          icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0)	//lzh: compact_pointer_ 以后的(没 compact 过)文件纳入 compact 范围
+	  {
         c->inputs_[0].push_back(f);
         break;
       }
     }
+
+	//lzh: level 层所有的文件之前都已经 compact 过. 但是本函数仍被调用, 则说明由于某些情况(如本层 size 仍较大, 或触发了 seek_compaction)
+	//lzh: 需要再次 compact, 所以从本层第一个文件开始.
     if (c->inputs_[0].empty()) {
       // Wrap-around to the beginning of the key space
       c->inputs_[0].push_back(current_->files_[level][0]);
@@ -1203,6 +1275,8 @@ Compaction* VersionSet::PickCompaction() {
   } else if (seek_compaction) {
     level = current_->file_to_compact_level_;
     c = new Compaction(level);
+
+	//lzh: 将 level 层的 current_->file_to_compact_ 文件 compact 到 level+1 层
     c->inputs_[0].push_back(current_->file_to_compact_);
   } else {
     return NULL;
@@ -1234,7 +1308,7 @@ Compaction* VersionSet::PickCompaction() {
 
 	c->inputs_[0] 简写为 c[0], c->inputs_[1] 简写为 c[1]
 	
-	1. PickCompaction 中 level 上的一个待 compact 的文件与第 0 层文件相交的文件得到 c[0]
+	1. PickCompaction 中 level 上的一个待 compact 的文件集合是 c[0]. (注意第 0 层的特殊情况. 详见 PickCompaction 最末的处理)
 
 	2. 由上面的 c[0] 与 level+1 层相交的文件得到 c[1], c[0],c[1] 范围是 (all_start, all_limit)
 
@@ -1245,8 +1319,6 @@ Compaction* VersionSet::PickCompaction() {
 	5. 若 expanded1 的大小大于 c[1] 则扩展至此, c[0]=expanded0, c[1]=expanded1, c[0] 范围是 (smallest, largest), c[0]并c[1] 范围是 (all_start, all_limit). 否则转到 6.
 
 	6. 计算 c[0]并c[1] 与 level+2 相交文件集合作为 c->grandparents_. 计算 level 层下一次 compact 的起始位置是 largest, 即本次compact 的上界c[0].largest
-
-	
 */
 /************************************************************************/
 void VersionSet::SetupOtherInputs(Compaction* c) {

@@ -821,7 +821,7 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
 		z	("1000","first", 1)
 
 		括号内分别是 key - value - sequence. 
-		那么 compact->smallest_snapshot 为 3, 遍历到 x 时, 虽然 sequence 大于 3, 但是 x 显然应该 drop, 而遍历到
+		那么 compact->smallest_snapshot 为 3, 遍历到 x 时, 虽然 sequence 大于 3, 但是 x 显然应该 drop 掉, 而遍历到
 		y 时虽然 sequence 小于 3 但是 y 显然不应该 drop.
 
 		所以使用 last_sequence_for_key 去达到一个效果: 每个相同的 user_key 只保留 sequence 最大的那个
@@ -917,7 +917,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 	  //lzh: 原因之一, Internal key 的排序规则是: user_key 正序比较 --> sequence number 逆序 --> type 的逆序
 	  //lzh: 所以 ikey.sequence < last_sequence_for_key <= compact->smallest_snapshot
 	  //lzh: 所以当整个 compact 中的最小的 sequence 都比 ikey.sequence 大, 则当前的记录应该被 drop 掉
-	  //lzh: 原因之二, 如果用 ikey.sequence 来判断当前 ikey 的 drop，那么当 ikey.user_key 第一次被遍历时, 当 ikey.sequence 较小时, ikey 会被 drop，但其实不应该 drop
+	  //lzh: 原因之二, 如果用 ikey.sequence 来判断当前 ikey 的 drop，那么当 ikey.user_key 是第一次被遍历时, 当 ikey.sequence 较小时, ikey 会被 drop，但其实不应该 drop
 
 	  //lzh: 注意此处, last_sequence_for_key 可以小于 compact->smallest_snapshot: 后者可能在此函数的一开头被赋值为 versions_->LastSequence().
 	  //lzh: 而待 compation 的数据可能是 sst 中的数据, 它们的 sequence 必然小于 versions_->LastSequence()
@@ -992,6 +992,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   if (status.ok() && shutting_down_.Acquire_Load()) {
     status = Status::IOError("Deleting DB during compaction");
   }
+
+  //lzh: 最后一轮循环中正在构建的 sst 大小没有达到阈值还没来得及写入磁盘, 此处需要处理
   if (status.ok() && compact->builder != NULL) {
     status = FinishCompactionOutputFile(compact, input);
   }
@@ -1085,7 +1087,10 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
 
 /************************************************************************/
 /* 
-	lzh: 到这儿了
+	lzh: 从内存中的 mem, imem, VersionSet (缓存的sst文件/磁盘上的sst文件) 中查找 key
+		若是最后一种情况, 在 VersionSet 中查找时, 需要在多于 1 个文件中查找, 则认为
+		查询的效率比较低, 需要做 compaction 以提高后续查找效率. compaction 的对象是
+		第二个被查找的文件
 */
 /************************************************************************/
 Status DBImpl::Get(const ReadOptions& options,
@@ -1107,6 +1112,8 @@ Status DBImpl::Get(const ReadOptions& options,
   if (imm != NULL) imm->Ref();
   current->Ref();
 
+  //lzh: 如果内存中的 mem, imm 中都没有找到 lkey, 则需要从 缓存的 sst 文件, 甚至是硬盘的 sst 文件中去查找
+  //lzh: 那么需要更新统计情况: 是否从 sst 文件中 seek 的次数过多(若是则需要 compact 以提高后续的查询效率).
   bool have_stat_update = false;
   Version::GetStats stats;
 
@@ -1114,7 +1121,7 @@ Status DBImpl::Get(const ReadOptions& options,
   {
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
-	//lzh: 使用 user_key 和 版本号 构造 LookupKey
+	//lzh: 使用 userkey.length, user_key, sequencenum, keySeektype 构造 LookupKey
     LookupKey lkey(key, snapshot);
     if (mem->Get(lkey, value, &s)) {
       // Done

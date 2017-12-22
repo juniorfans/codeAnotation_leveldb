@@ -15,11 +15,12 @@ namespace leveldb {
 class VersionSet;
 
 /************************************************************************
-FileMetaData用于描述每一个.sst文件的信息，它记录了一个SSTable中的最小和最大的Key值，即Key值的变化区间，极大的提高了查找操作的效率
+	lzh: FileMetaData用于描述每一个.sst文件的信息，它记录了一个SSTable中的最小和最大的Key值，
+		即Key值的变化区间，极大的提高了查找操作的效率
 ************************************************************************/
 struct FileMetaData {
   int refs;
-  int allowed_seeks;          // Seeks allowed until compaction
+  int allowed_seeks;          // Seeks allowed until compaction //lzh: 次数用光后则需要 compact
   uint64_t number;
   uint64_t file_size;         // File size in bytes
   InternalKey smallest;       // Smallest internal key served by table

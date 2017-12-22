@@ -105,7 +105,7 @@ void InternalKeyComparator::FindShortSuccessor(std::string* key) const {
 /************************************************************************/
 /* 
 	lzh:
-	往 dst 中依次压入: 
+	往 dst 中依次压入: user_key的长度, user_key, sequenceNumber,type 
 
 	索引位置			数据
 	start_		--->	user_key 的长度+8 的变长编码

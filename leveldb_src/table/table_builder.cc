@@ -38,10 +38,10 @@ struct TableBuilder::Rep {
   //
 
   // Invariant: r->pending_index_entry is true only if data_block is empty.
-  //lzh: 当且仅当 data_block 是空时 pending_index_entry 是 true
+  //lzh: 有一个 data_block 刚刚完成了 Flush (此时 pending_index_entry 被设置为 true)，现在需要为它生成一个索引条目 
   bool pending_index_entry;
 
-  //lzh: 用于处理加入到 index block
+  //lzh: 生成那个完成了 Flush 的 data_block 对应的索引条目并加入到 index_block 中
   BlockHandle pending_handle;  // Handle to add to index block	
 
   std::string compressed_output;
@@ -85,6 +85,12 @@ Status TableBuilder::ChangeOptions(const Options& options) {
   return Status::OK();
 }
 
+/************************************************************************/
+/* 
+	lzh: 往 sst 当前处理的块/Block 中加入 kv，若此块满了则 Flush(写入到磁盘)，
+	且设置此块的偏移和大小, 生成此块的索引条目加入到 index_block
+*/
+/************************************************************************/
 void TableBuilder::Add(const Slice& key, const Slice& value) {
   Rep* r = rep_;
   assert(!r->closed);
@@ -92,29 +98,28 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
 
   //lzh: 注意因为  r->last_key 可能是 r->num_entries 为零时通过 FindShortestSeparator 计算出来的, 所以要判断 r->num_entries
   if (r->num_entries > 0) {
-	  //lzh: 以递增的顺序加入
+	  //lzh: 保证 TableBuilder 以递增的顺序 Add
     assert(r->options.comparator->Compare(key, Slice(r->last_key)) > 0);
   }
 
-  //lzh: pending_index_entry 的意思是: 当前块 r->data_block 满了, 已经 Flush 掉, 当前需要写入那个块的 index 数据
-  //lzh: 最开始 pending_index_entry 是 false, 执行完 Flush 之后 pending_index_entry 才会是 true
+  //lzh: pending_index_entry 的意思是: 当前块 r->data_block 满了, 已经 Flush 掉(写入磁盘), pending_index_entry 被设置为 true，当前需要写入那个块的 index 数据
+  //lzh: 现在将刚刚已经 Flush 的 Block 的 index 信息写入 index_block
   if (r->pending_index_entry) {
-    assert(r->data_block.empty());
+    assert(r->data_block.empty());//lzh: Flush 完一个 data_block 后立即生成一个 index_block. 
+									//lzh: 暂时停止生成 data_block 所以这里断定 data_block 为空
 
-	//lzh: last_key 是上一个 key. 若重新开始一个 block 则 last_key 的值并非是上一个 block 的最后一个 key
-	//lzh: 而是寻找到一个位于区间 (last_key, key) 之间的最小值(长度必小于 last_key), 将此值加入 index_block. 
-	//lzh: 这样做的目的在于减少了 index_block 中 key 的长度
+	//lzh: index_block 的每个条目是一个键值对: key -> index_handle。定位 k 所在的 Block 时，在 index_block 里面使用二分法
+	//lzh: 搜索到最后一个键比 k 小的条目，再取出 index_handle，这样就知道了目标 Block 的偏移和大小。
 
+	//lzh: r->last_key 是刚 Flush 的 Block 的最后一个键。函数参数 key 是当前要加入到下一个 Block 中的首个键。
+	//lzh: 我们寻找比 r->last_key 大但比 key 小的最小值(长度比较短) 设置到 r->last_key 中
+	//lzh: 作为 index_block 条目的键，这样可以在逻辑正确的情况下减少 index_block 占用的空间
     r->options.comparator->FindShortestSeparator(&r->last_key, key);
     std::string handle_encoding;
 
-	//lzh: pending_handle 中的 offset/size 会在 WriteBlock 中被更改. 
-	//lzh: handle_encoding 中即是当前块 offset&size 信息
+	//lzh: r->pending_handle 中的 offset/size 会在 WriteBlock 中被设置
     r->pending_handle.EncodeTo(&handle_encoding);
 
-	//lzh: 将 (k, v) 写入 index_block, k=r->last_key, v=handle_encoding
-	//lzh: 这样做的好处是, 搜索一个 key 时立即就能从 index_block 中根据二分查找法找到小于 key 的最大 k,
-	//lzh: k 对应的 handle_encoding 就指示了 key 所在的块的 offset 和 size.
     r->index_block.Add(r->last_key, Slice(handle_encoding));
     r->pending_index_entry = false;
   }
@@ -125,12 +130,19 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
 
   const size_t estimated_block_size = r->data_block.CurrentSizeEstimate();
 
-  //lzh: 当前块 datablock 的大小到达阈值, 执行 flush. flush 函数中会设置下次需要写入此块的 index block
+  //lzh: 当前块 data_block 的大小到达阈值, 执行 Flush.
   if (estimated_block_size >= r->options.block_size) {
     Flush();
   }
 }
 
+/************************************************************************/
+/* 
+	lzh: 
+		1.将当前 data_block 写入到磁盘
+		2.设置 r->pending_index_entry=true, 并记录当前块的偏移和大小, 下一次需要添加此块的 index 条目到 index_block
+*/
+/************************************************************************/
 void TableBuilder::Flush() {
   Rep* r = rep_;
   assert(!r->closed);
@@ -146,6 +158,13 @@ void TableBuilder::Flush() {
   }
 }
 
+/************************************************************************/
+/* 
+	lzh: 
+		1.将 block 写入到磁盘(可能会压缩)
+		2.将 block 的偏移大小写入到 handle 中，（注意首个 block 的 offset是0，且 block 的 size 不含 trailer 大小）
+*/
+/************************************************************************/
 void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
   // File format contains a sequence of blocks where each block has:
   //    block_data: uint8[n]
@@ -178,16 +197,14 @@ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
     }
   }
 
-  //lzh: 设置当前块的 index 数据. 
-  //lzh: 首个 block 的 offset 为 0, size 为 block_contents.size(), 注意 size 不含 trailer 大小
+  //lzh: 记录当前块的 index 数据. 
   handle->set_offset(r->offset);
   handle->set_size(block_contents.size());
 
   r->status = r->file->Append(block_contents);
   if (r->status.ok()) {
 
-	  //lzh: 每个block后面都会有5个字节的trailer。
-	  //lzh: 第 1 个字节表示 block 内的数据是否采用了压缩, 后面 4个字节是 block 数据的 crc 校验码. 参见 资源文件 sst_and_block.bmp 文件
+	  //lzh: 每个block后面都会有5个字节的trailer，第1个字节表示 block 内的数据是否采用了压缩, 后面 4个字节是 block 数据的 crc 校验码. 参见 资源文件 sst_and_block.bmp 文件
     char trailer[kBlockTrailerSize];
     trailer[0] = type;
     uint32_t crc = crc32c::Value(block_contents.data(), block_contents.size());
@@ -208,9 +225,15 @@ Status TableBuilder::status() const {
 
 /************************************************************************/
 /* 
-	lzh: Add 和 Flush 会依次完成所有的 data_block 文件写入, index 信息收集
-	接下来 Finish 会依次写入每个 data_block 对应的 meta_balock
+	lzh: 最后调用 Finish 完成这些事情：
+		1.Flush 掉还没有写入磁盘的 data_block
+		2.写入一个 metaindex_block，当前的实现是直接写入一个空的块
+		3.生成最后一个 Flush 的块的索引条目并加入到 index_block 中
+		4.将 index_block 写入到磁盘
 
+		注意当前版本没有写入 meta_block
+
+	回顾一下 sst 的格式:
 	1. meta_block：每个data_block对应一个meta_block ，保存data_block中的key size/value size/kv counts之类的统计信息，当前版本未实现
 	2. metaindex_block: 保存meta_block的索引信息。当前版本未实现。
 	3. index_block: 每个 data_block 的 offset/size 都会写入到这个 index_block 中
@@ -219,24 +242,25 @@ Status TableBuilder::status() const {
 /************************************************************************/
 Status TableBuilder::Finish() {
   Rep* r = rep_;
+  //lzh: 当前块还没有处理完，写入磁盘
   Flush();
   assert(!r->closed);
   r->closed = true;
   BlockHandle metaindex_block_handle;
   BlockHandle index_block_handle;
   if (ok()) {
+	  //lzh: 下面写入一个空的 block 
     BlockBuilder meta_index_block(&r->options);
     // TODO(postrelease): Add stats and other meta blocks
-	//lzh: 没有对 meta_index_block 调用过 Add  函数，则说明这个 block 中没有 entry
-	//lzh: 此处写入一个空的 block, 只含有 restarts 和 num_of_restarts 及 trailer. 
-	//lzh: 前者是 0 表示了 entry 大小为 0, 后者是 0 表示了有 0 个 restart 点
+	//lzh: 因为没有对 meta_index_block 调用过 Add  函数，这个 block 中没有 entry
+	//lzh: 此处写入一个空的 block, 只含有 num_of_restarts(0) 及 trailer
     WriteBlock(&meta_index_block, &metaindex_block_handle);
   }
   if (ok()) {
 	  //lzh: 最后一个处理的块的 index 还没有加入到 index_block 里，现在处理
     if (r->pending_index_entry) {
 
-		//lzh: 最后一个块, 找到大于 r->last_key 的最小值. 目的同 FindShortestSeparator
+		//lzh: 最后一个块, 找到大于 r->last_key 的最小值. 目的同 FindShortestSeparator, 减少 index_block 中键的长度
       r->options.comparator->FindShortSuccessor(&r->last_key);
       std::string handle_encoding;
       r->pending_handle.EncodeTo(&handle_encoding);
@@ -247,6 +271,7 @@ Status TableBuilder::Finish() {
 	//lzh: 接下来写入 index_block
     WriteBlock(&r->index_block, &index_block_handle);
   }
+  //lzh: 最后写入 footer: metaindex_block 的偏移大小和 index_block 的偏移大小
   if (ok()) {
     Footer footer;
     footer.set_metaindex_handle(metaindex_block_handle);

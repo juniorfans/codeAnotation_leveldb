@@ -15,8 +15,7 @@ namespace {
 /************************************************************************/
 /* 
 	lzh: MergingIterator 对外提供 Prev, Next, Seek 接口, 
-		对内的实现是管理着一堆 IteratorWrapper, 通过它们的 Prev, Next, Seek 实现
-		那些功能
+		对内的实现是管理着一堆 IteratorWrapper, 通过它们的 Prev, Next, Seek 实现那些功能
 */
 /************************************************************************/
 class MergingIterator : public Iterator {
@@ -79,6 +78,7 @@ class MergingIterator : public Iterator {
 
   /************************************************************************/
   /* 
+	lzh: 向后遍历
 	lzh: 分两种情况
 		1.	若上一次遍历的方向是 kForward, 即与本函数需要的遍历方向
 			一致, 则只需要将 迭代器 current_ 下一个元素 next 与其它迭代器各自指
@@ -112,9 +112,13 @@ class MergingIterator : public Iterator {
       direction_ = kForward;
     }
 
+	if(current_->Valid())
+		theLastCurrentKey = current_->key();
     current_->Next();
     FindSmallest();
   }
+
+  Slice theLastCurrentKey ;
 
   /************************************************************************/
   /* 
@@ -155,6 +159,7 @@ class MergingIterator : public Iterator {
     }
 
     current_->Prev();
+	//lzh: 
     FindLargest();
   }
 
@@ -205,13 +210,29 @@ class MergingIterator : public Iterator {
 
 /************************************************************************/
 /* 
-	lzh: 定位到最小的
+	lzh: 正向遍历，定位到最小的。
+	当第 x 个与第 y 个迭代器的 key 一样时，x< y，返回 x。这一点与 FindSmallest 相反。
+	这是因为 FindSmallest 与 Next 方向一致：相等的 key ，先遇到的比较小
 */
 /************************************************************************/
 void MergingIterator::FindSmallest() {
   IteratorWrapper* smallest = NULL;
   for (int i = 0; i < n_; i++) {
     IteratorWrapper* child = &children_[i];
+
+	if(child->Valid() && NULL!=smallest)
+	{
+		Slice ckey = child->key();
+		Slice smallestKey = smallest->key();
+		Slice lastCKey = theLastCurrentKey;
+		int r1 = comparator_->Compare(lastCKey, smallestKey);
+		int r2 = comparator_->Compare(lastCKey, ckey);
+		int r3 = comparator_->Compare(ckey, smallestKey);
+		r1 = 0;
+	}
+	
+
+
     if (child->Valid()) {
       if (smallest == NULL) {
         smallest = child;
@@ -225,7 +246,9 @@ void MergingIterator::FindSmallest() {
 
 /************************************************************************/
 /* 
-	lzh: 定位到最大的
+	lzh: 反向遍历，定位到最大的，
+	当第 x 个与第 y 个迭代器的 key 一样时，x > y，返回 x。这一点与 FindSmallest 相反。
+	先 Findsmallest 逻辑保持一致，相同的 key 先遇到的较小，所以后遇到的较大。
 */
 /************************************************************************/
 void MergingIterator::FindLargest() {
