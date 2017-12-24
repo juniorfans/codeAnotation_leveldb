@@ -212,7 +212,8 @@ class Version::LevelFileNumIterator : public Iterator {
 	lzh: 根据 table 缓存 arg 和文件信息 file_value (file number, file size) 生成迭代器. 
 	若 arg 中没有缓存此文件, 则打开文件加入到缓存同时返回此文件的迭代器.
 
-	注意此函数的 file_value 参数正好与迭代器 LevelFileNumIterator 的 value 一致
+	注意此函数的 file_value 参数正好与迭代器 LevelFileNumIterator 的 value 一致，即 LevelFileNumIterator
+	的输出即是 GetFileIterator 的输入
 */
 /************************************************************************/
 static Iterator* GetFileIterator(void* arg,

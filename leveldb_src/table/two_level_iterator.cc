@@ -18,10 +18,8 @@ typedef Iterator* (*BlockFunction)(void*, const ReadOptions&, const Slice&);
 
 /************************************************************************/
 /* 
-lzh:	TwoLevelIterator 是一个二维的迭代器. 即 TwoLevelIterator 的 value 是另一个
-		迭代器对象的指针.关联想像二维指针即可明白.
-
-		这样设计的根本原因是, table 文件/sst 文件的格式是, 
+lzh:	TwoLevelIterator 是一个二维的迭代器. 即 TwoLevelIterator 的 value 与另一个迭代器对象关联. 
+		查找一个元素需要两次 Seek：第一次找到此元素所在的迭代器，第二次在上一个迭代器上查找此元素。
 */
 /************************************************************************/
 class TwoLevelIterator: public Iterator {
@@ -130,7 +128,11 @@ void TwoLevelIterator::Prev() {
   SkipEmptyDataBlocksBackward();
 }
 
-
+/************************************************************************/
+/* 
+	lzh: 向前(Next 方向)跳过空的或无效的数据块
+*/
+/************************************************************************/
 void TwoLevelIterator::SkipEmptyDataBlocksForward() {
   while (data_iter_.iter() == NULL || !data_iter_.Valid()) {
     // Move to next block
@@ -138,12 +140,19 @@ void TwoLevelIterator::SkipEmptyDataBlocksForward() {
       SetDataIterator(NULL);
       return;
     }
+	//lzh: 索引块往后遍历，即得到下一个数据块
     index_iter_.Next();
     InitDataBlock();
+	//lzh: 新块的第一个位置
     if (data_iter_.iter() != NULL) data_iter_.SeekToFirst();
   }
 }
 
+/************************************************************************/
+/* 
+	lzh: 向后(Prev 方向)跳过空的或无效的数据块
+*/
+/************************************************************************/
 void TwoLevelIterator::SkipEmptyDataBlocksBackward() {
   while (data_iter_.iter() == NULL || !data_iter_.Valid()) {
     // Move to next block

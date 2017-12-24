@@ -14,6 +14,7 @@ namespace leveldb {
 // Return a new iterator that converts internal keys (yielded by
 // "*internal_iter") that were live at the specified "sequence" number
 // into appropriate user keys.
+// lzh: 此处的 internal_iter 即是 MergingIterator
 extern Iterator* NewDBIterator(
     const std::string* dbname,
     Env* env,

@@ -141,6 +141,16 @@ inline bool DBIter::ParseKey(ParsedInternalKey* ikey) {
   }
 }
 
+/************************************************************************/
+/* 
+	lzh:
+	Next 函数的需求是要定位到下一个有效元素位置。
+	若当前遍历方向是 kReverse ，设 saved_key_ 对应的用户键是 user_key, 则当前迭代器位置指在了最左边(Prev 方向)
+	的那个 user_key 的左边一个位置(Prev 函数的注释中有详细说明).
+	显然 Next 要定位到后面紧接着的有效元素的位置，这就需要跳过 user_key 更旧的版本或失效的版本。
+	这在 FindNextUserEntry 会处理.
+*/
+/************************************************************************/
 void DBIter::Next() {
   assert(valid_);
 
@@ -151,7 +161,9 @@ void DBIter::Next() {
     // so advance into the range of entries for this->key() and then
     // use the normal skipping code below.
     if (!iter_->Valid()) {
-      iter_->SeekToFirst();
+      iter_->SeekToFirst();//lzh: 注意，leveldb 中所有迭代器失效位置都在最未尾的后面一个位置，当 iter 失效时设置为 First 位置，
+						   //lzh: 我们的目标是要跳到当前 saved_key_ 后面一个有效的位置。
+						   //lzh: 所以将 iter 设置为 iter.Next 或者 iter.First 在逻辑上都是正确的，FindNextUserEntry(true, skip) 会处理正确
     } else {
       iter_->Next();
     }
@@ -164,7 +176,7 @@ void DBIter::Next() {
 
   // Temporarily use saved_key_ as storage for key to skip.
   std::string* skip = &saved_key_;
-  SaveKey(ExtractUserKey(iter_->key()), skip);	//lzh: 注意，此处间接着设置了 iter 的 user_key 到 saved_key_ 里面
+  SaveKey(ExtractUserKey(iter_->key()), skip);	//lzh: 注意，此处设置了 iter 的 user_key 到 saved_key_ 里面
   
   //lzh: 跳过 iter_key().user_key_ 更旧的版本 或者 跳过当 iter_key()已经是一个 deletion 了
   FindNextUserEntry(true, skip);
@@ -175,7 +187,7 @@ void DBIter::Next() {
 /* 
 	lzh: 该函数耦合了两个功能: 
 		1. 遍历过程中遇到了某个 user_key 的类型是 delete, 则后面跳过此 user_key, 
-			若跳过后又遇到其它 user_key 的最新记录(也即此 user_key 最先遍历到的版本)是 deletion, 则继续重复处理. -- 强制(skipping 为 true|false 都有此功能)
+			若跳过后又遇到其它 user_key 的最新记录(也即此 user_key 最先遍历到的版本)是 deletion, 则继续重复处理. -- (skipping 为 true|false 都有此功能)
 		2. 跳过相同 user_key 的旧版本 -- skipping 为 true 时有此功能
 
 	skiping 的意思是, 若以后再遇到此 user_key 是否要跳过. 函数被调用之初, user_key 指的是 *skip,  后续指的是遍历到的 user_key
@@ -199,6 +211,7 @@ void DBIter::FindNextUserEntry(bool skipping, std::string* skip) {
   assert(direction_ == kForward);
   do {
     ParsedInternalKey ikey;
+	//lzh: sequence_ 是传入的最新的版本号，只处理小于此版本的数据
     if (ParseKey(&ikey) && ikey.sequence <= sequence_) {
       switch (ikey.type) {
         case kTypeDeletion:
@@ -410,6 +423,7 @@ void DBIter::SeekToLast() {
 
 }  // anonymous namespace
 
+// lzh: 此处的 internal_iter 即是 MergingIterator
 Iterator* NewDBIterator(
     const std::string* dbname,
     Env* env,

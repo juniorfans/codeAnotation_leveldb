@@ -103,7 +103,8 @@ static void ReleaseBlock(void* arg, void* h) {
 // into an iterator over the contents of the corresponding block.
 /************************************************************************/
 /* 
-	lzh: 返回 Table 中 index_value 位置的 Block 的迭代器. 
+	lzh: 返回 Table 中 index_value 位置的 Block 的迭代器. 其被用来对一个 sst 文件构造 TwoLevelIterator。
+
 	1.	如果此 Table 具有块缓存 block_cache 则块缓存中读取, 如果块缓存中没有该数据则从 table 文件(sst 文件)
 		中读取并加入到块缓存中(注意注册 ReleaseBlock 函数).
 	2.	如果此 Table 无块缓存则直接读取 table 文件, 注册 DeleteBlock 函数
@@ -116,10 +117,10 @@ Iterator* Table::BlockReader(void* arg,
   Cache* block_cache = table->rep_->options.block_cache;
   Block* block = NULL;
 
-  //lzh: table 中 index_value 元素, 在缓存中的位置信息
+  //lzh: 目标  block 在缓存中的位置信息
   Cache::Handle* cache_handle = NULL;
 
-  //lzh: 与 index_value 一样, handle 是 Table 中的索引信息(offset, size)
+  //lzh: 结构化的 index_value，用于表示 Block 中的索引信息(offset, size)
   BlockHandle handle;
   Slice input = index_value;
   Status s = handle.DecodeFrom(&input);
@@ -128,13 +129,13 @@ Iterator* Table::BlockReader(void* arg,
 
   if (s.ok()) {
     if (block_cache != NULL) {
-		//lzh: 计算 Table 中索引 handle 指示的元素在缓存 block_cache 中的索引数据
+		//lzh: 计算目标 Block 在缓存 block_cache 中的索引 key
       char cache_key_buffer[16];
       EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
       EncodeFixed64(cache_key_buffer+8, handle.offset());
       Slice key(cache_key_buffer, sizeof(cache_key_buffer));
 
-	  //lzh: key 即是指定元素在缓存 block_cache 中对应的索引信息
+	  //lzh: key 即是目标 Block 在缓存 block_cache 中对应的索引键
       cache_handle = block_cache->Lookup(key);
       if (cache_handle != NULL) {
 		  //lzh: 位置信息有效则查看此位置的值. 实际上就是 ((LRUHandle*)cache_handle)->value
