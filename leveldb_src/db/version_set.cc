@@ -24,6 +24,9 @@ static const int kTargetFileSize = 2 * 1048576;
 
 // Maximum bytes of overlaps in grandparent (i.e., level+2) before we
 // stop building a single file in a level->level+1 compaction.
+//lzh: compaction 生成的每一个 sst 与 level+2 层所有文件的重叠字节数上限: 10 个 sst 大小
+//lzh: 此限制的目的是防止每个新生成的 sst 文件在日后的 compaction 中重叠过多，速度慢
+//lzh: 注意此限制针对的不是一次 compaction 中生成的文件集合的限制，而是对每个文件都有此限制
 static const int64_t kMaxGrandParentOverlapBytes = 10 * kTargetFileSize;
 
 static double MaxBytesForLevel(int level) {
@@ -310,7 +313,7 @@ static bool NewestFirst(FileMetaData* a, FileMetaData* b) {
 		
 		2.	对于待查找文件列表, 在 table 缓存(vset_->table_cache_) 中查找每一个文件中是否包含 k(若缓存中没有此文件则打开并加入到缓存)
 
-	Get 函数还有另外一个功能: 若查找过程中对多于一个文件进行了 seek, 则需要记录第二个 seek 的文件, 用于后续的 compaction, 以提高后面查询的效率
+	Get 函数还有另外一个功能: 查找时，对于第一个正式查找的 sst 文件，并没有在它里面命中。则需要标记这个文件，判断是否需要用于后续的 compaction, 以提高后面查询的效率
 */
 /************************************************************************/
 Status Version::Get(const ReadOptions& options,
@@ -490,9 +493,11 @@ std::string Version::DebugString() const {
 class VersionSet::Builder {
  private:
   // Helper to sort by v->files_[file_number].smallest
+ //lzh: FilemMetaData 的排序算法：使用文件的 smallest
   struct BySmallestKey {
     const InternalKeyComparator* internal_comparator;
 
+	//lzh: 先以 FileMetaData.smallest 作为比较依据，当它们相等时则以 FileMetaData.number 作为比较依据
     bool operator()(FileMetaData* f1, FileMetaData* f2) const {
       int r = internal_comparator->Compare(f1->smallest, f2->smallest);
       if (r != 0) {
@@ -504,18 +509,25 @@ class VersionSet::Builder {
     }
   };
 
+  //lzh: 基于 std::set 定义的文件集合，使用 BySmallestKey 作为排序依据
   typedef std::set<FileMetaData*, BySmallestKey> FileSet;
   struct LevelState {
     std::set<uint64_t> deleted_files;
     FileSet* added_files;
   };
 
+  //lzh: 变迁历史中的 Version
   VersionSet* vset_;
+	
+  //lzh: 基础 Version
   Version* base_;
+
+  //lzh: 用来接收 vset_ 中新增/删除文件
   LevelState levels_[config::kNumLevels];
 
  public:
   // Initialize a builder with the files from *base and other info from *vset
+  //lzh: base 表示当前的版本，vset 表示变迁历史中的版本
   Builder(VersionSet* vset, Version* base)
       : vset_(vset),
         base_(base) {
@@ -528,6 +540,8 @@ class VersionSet::Builder {
   }
 
   ~Builder() {
+	  //lzh: Builder 已经完成任务了，可以删除内存数据。注意下面的代码中没有处理 deleted_files，
+	  //lzh: 不需要回收内存是因为 LevelState 定义了它存储在栈上，而不是堆上。而不需要 unref 是因为这些 deleted_files 在本类中不会被 ref
     for (int level = 0; level < config::kNumLevels; level++) {
       const FileSet* added = levels_[level].added_files;
       std::vector<FileMetaData*> to_unref;
@@ -545,10 +559,19 @@ class VersionSet::Builder {
         }
       }
     }
+	
     base_->Unref();
   }
 
   // Apply all of the edits in *edit to the current state.
+  /************************************************************************/
+  /* 
+	lzh: 将 edit 中这些信息保存到 VersionSet 中: 
+		各层的 compact_pointers ---> vset_->compact_pointer_[level]
+		各层的待删除文件 ---> levels_[level].deleted_files
+		各层待新增加文件 ---> levels_[level].added_files
+  */
+  /************************************************************************/
   void Apply(VersionEdit* edit) {
     // Update compaction pointers
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
@@ -600,6 +623,12 @@ class VersionSet::Builder {
   }
 
   // Save the current state in *v.
+  /************************************************************************/
+  /* 
+	lzh:
+		将当前版本的 sst 文件加入到 v 中
+  */
+  /************************************************************************/
   void SaveTo(Version* v) {
     BySmallestKey cmp;
     cmp.internal_comparator = &vset_->icmp_;
@@ -615,23 +644,28 @@ class VersionSet::Builder {
            added_iter != added->end();
            ++added_iter) {
         // Add all smaller files listed in base_
+	   //lzh: std::upper_bound(base_iter, base_end, *added_iter, cmp) 算法是要在 [base_iter, base_end) 范围中找到首个大于 *added_iter 的位置，若没有则返回 base_end
+	   //lzh: 对 base_files 中的区段: [bpos, base_end) 循环，处理 MaybeAddFile
         for (std::vector<FileMetaData*>::const_iterator bpos
                  = std::upper_bound(base_iter, base_end, *added_iter, cmp);
              base_iter != bpos;
              ++base_iter) {
           MaybeAddFile(v, level, *base_iter);
         }
-
+		
+	    //lzh: 对所有 added_files，处理 MaybeAddFile
         MaybeAddFile(v, level, *added_iter);
       }
 
       // Add remaining base files
+	  //lzh: 边界条件，防止还有剩下的 base_files
       for (; base_iter != base_end; ++base_iter) {
         MaybeAddFile(v, level, *base_iter);
       }
 
 #ifndef NDEBUG
       // Make sure there is no overlap in levels > 0
+	  //lzh: 保证非第 0 层的文件都没有键值相交
       if (level > 0) {
         for (uint32_t i = 1; i < v->files_[level].size(); i++) {
           const InternalKey& prev_end = v->files_[level][i-1]->largest;
@@ -648,6 +682,13 @@ class VersionSet::Builder {
     }
   }
 
+  /************************************************************************/
+  /* 
+	lzh: 将 f 加入到版本 v 的第 level 文件中
+		若 f 被包含在第 levels[level].deleted_files 的文件中，则不会增加此文件。否则增加，同时递增 f 的 ref
+		注意，本函数断定：level 一定不是第 0 层且 v 中第 level 层文件不是空
+  */
+  /************************************************************************/
   void MaybeAddFile(Version* v, int level, FileMetaData* f) {
     if (levels_[level].deleted_files.count(f->number) > 0) {
       // File is deleted: do nothing
@@ -692,6 +733,14 @@ VersionSet::~VersionSet() {
   delete descriptor_file_;
 }
 
+/************************************************************************/
+/* 
+	lzh: 增加一个 Version
+		1.减少对当前 Version 的引用
+		2.让指定的 v 成为当前的 Version: current_，增加对 current_的引用
+		3.将 v 加入到双链表中，紧挨着 dummy_versions_，位于左边(prev 方向)
+*/
+/************************************************************************/
 void VersionSet::AppendVersion(Version* v) {
   // Make "v" current
   assert(v->refs_ == 0);
@@ -703,6 +752,7 @@ void VersionSet::AppendVersion(Version* v) {
   v->Ref();
 
   // Append to linked list
+  // lzh: 将 v 添加到双链表中 dummy_versions_ 的前面
   v->prev_ = dummy_versions_.prev_;
   v->next_ = &dummy_versions_;
   v->prev_->next_ = v;
@@ -712,8 +762,9 @@ void VersionSet::AppendVersion(Version* v) {
 
 /************************************************************************/
 /* 
-	lzh: 在currentversion上应用指定的VersionEdit，生成新的MANIFEST信息，保存到磁盘上，并用作current version
-
+	lzh: 记录并应用 VersionEdit
+	1.将当前版本 current_ 与指定的版本差异 edit 计算，生成最新的 Version，将它设置为最新版本。
+	2.生成新的 MANIFEST ，保存到磁盘上，并用作current version
 */
 /************************************************************************/
 Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
@@ -734,7 +785,8 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   edit->SetNextFile(next_file_number_);
   edit->SetLastSequence(last_sequence_);
 
-  //lzh: 2.创建一个新的Version v，并把新的edit变动保存到v中。
+  //lzh: 2.创建一个新的Version v，并把当前所有的 Version 和版本变化 edit 都构建到 v 中，
+  //lzh: 做完这些步骤后 v 变为了最全最新的版本.
   Version* v = new Version(this);
   {
     Builder builder(this, current_);
@@ -754,7 +806,8 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   if (descriptor_log_ == NULL) {
     // No reason to unlock *mu here since we only hit this path in the
     // first call to LogAndApply (when opening the database).
-	  //lzh: 这里不需要unlock *mu因为我们只会在第一次调用LogAndApply时才走到这里(打开数据库时).  
+	  //lzh: 这里不需要unlock *mu因为我们只会在第一次调用 LogAndApply 时才走到这里
+	  //lzh: 只有 descriptor_log_ 和 descriptor_file_ 等于 NULL 时才去新建
     assert(descriptor_file_ == NULL);
     new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
     edit->SetNextFile(next_file_number_);
@@ -766,7 +819,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   }
 
   // Unlock during expensive MANIFEST log write
-  //lzh: 向MANIFEST写入一条新的log，记录current version的信息。
+  //lzh: 向 MANIFEST 写入一条新的log，记录版本差异(VersionEdit) 的信息。
   //lzh: 在文件写操作时unlock锁，写入完成后，再重新lock，以防止浪费在长时间的IO操作上。
   {
     mu->Unlock();
@@ -784,7 +837,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
 	//lzh: 如果刚才创建了一个MANIFEST文件，通过写一个指向它的CURRENT文件  
-	//lzh: 安装它；不需要再次检查MANIFEST是否出错，因为如果出错后面会删除它 
+	//lzh: 不需要再次检查MANIFEST是否出错，因为如果出错后面会删除它 
     if (s.ok() && !new_manifest_file.empty()) {
       s = SetCurrentFile(env_, dbname_, manifest_file_number_);
     }
@@ -793,7 +846,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   }
 
   // Install the new version
-  //lzh: 安装这个 version
+  //lzh: 应用这个版本 v：将 v 设置为当前版本，并加入到双向链表管理中
   if (s.ok()) {
     AppendVersion(v);
     log_number_ = edit->log_number_;
@@ -821,6 +874,8 @@ Status VersionSet::Recover() {
   };
 
   // Read "CURRENT" file, which contains a pointer to the current manifest file
+  //lzh: 将 CURRENT 文件内容作为字符串读取到 current 中。CURRENT 文件中的内容类型 MANIFEST-000010，
+  //lzh: 它是一个文件名，表示当前 leveldb 记录元数据的文件。
   std::string current;
   Status s = ReadFileToString(env_, CurrentFileName(dbname_), &current);
   if (!s.ok()) {
@@ -831,6 +886,7 @@ Status VersionSet::Recover() {
   }
   current.resize(current.size() - 1);
 
+  //lzh: dbname_ 也是路径，类似 D:/levelDB/levelDb.db，levelDb.db 是文件名
   std::string dscname = dbname_ + "/" + current;
   SequentialFile* file;
   s = env_->NewSequentialFile(dscname, &file);
@@ -838,6 +894,7 @@ Status VersionSet::Recover() {
     return s;
   }
 
+  //lzh: 下面这些临时变量将记录从 manifest 文件中读出的 leveldb 元信息
   bool have_log_number = false;
   bool have_prev_log_number = false;
   bool have_next_file = false;
@@ -855,19 +912,9 @@ Status VersionSet::Recover() {
     Slice record;
     std::string scratch;
 
-	/************************************************************************/
-	/* 
-		lzh: 循环读取一个一个的 record
-	*/
-	/************************************************************************/
+	//lzh: 读取一个一个的 recored，使用一个临时变量 edit 去接收，然后根据 record 的类型设置到前面定义的临时变量中
     while (reader.ReadRecord(&record, &scratch) && s.ok()) {
       VersionEdit edit;
-
-	  /************************************************************************/
-	  /* 
-		record 解析放于 edit 成员中, 如 has_comparator_, comparator_ 等
-	  */
-	  /************************************************************************/
       s = edit.DecodeFrom(record);
 
       if (s.ok()) {
@@ -879,10 +926,11 @@ Status VersionSet::Recover() {
         }
       }
 
+	  //lzh: 读取了一个有效的 VersionEdit，将它应用到 builder 中。
       if (s.ok()) {
         builder.Apply(&edit);
       }
-
+	  
       if (edit.has_log_number_) {
         log_number = edit.log_number_;
         have_log_number = true;
@@ -940,6 +988,12 @@ Status VersionSet::Recover() {
   return s;
 }
 
+/************************************************************************/
+/* 
+	lzh: 标记文件号 number 已被使用。若在所有版本中 number 是一个超前的文件号，
+	则我们需要设置下一次可使用的文件号为 number+1
+*/
+/************************************************************************/
 void VersionSet::MarkFileNumberUsed(uint64_t number) {
   if (next_file_number_ <= number) {
     next_file_number_ = number + 1;
@@ -954,6 +1008,11 @@ static int64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
   return sum;
 }
 
+/************************************************************************/
+/* 
+	lzh: 计算版本 v 需要 compaction 和最优 compaction 层数。
+*/
+/************************************************************************/
 void VersionSet::Finalize(Version* v) {
   // Precomputed best level for next compaction
   int best_level = -1;
@@ -994,7 +1053,11 @@ void VersionSet::Finalize(Version* v) {
 
 /************************************************************************/
 /* 
-	lzh: 把currentversion保存到*log中，信息包括comparator名字、compaction点和各级sstable文件，函数逻辑很直观
+	lzh: 
+		将数据库在某时刻的元信息(也即快照)保存到给定的 manifest 文件中
+		1.comparator名字
+		2.compaction点
+		3.当前版本 current_ 在各层上的 sstable 文件
 */
 /************************************************************************/
 Status VersionSet::WriteSnapshot(log::Writer* log) {
@@ -1048,6 +1111,11 @@ const char* VersionSet::LevelSummary(LevelSummaryStorage* scratch) const {
   return scratch->buffer;
 }
 
+/************************************************************************/
+/* 
+	lzh: 计算InternalKey ikey 在版本 v 的 sst 文件中的大致偏移字节数
+*/
+/************************************************************************/
 uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
   uint64_t result = 0;
   for (int level = 0; level < config::kNumLevels; level++) {
@@ -1058,6 +1126,7 @@ uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
         result += files[i]->file_size;
       } else if (icmp_.Compare(files[i]->smallest, ikey) > 0) {
         // Entire file is after "ikey", so ignore
+		  //lzh: files[i]->smallest 都比 ikey 大，由于 files 是按 smallest 递增序排列的，所以无需往后遍历，直接 break
         if (level > 0) {
           // Files other than level 0 are sorted by meta->smallest, so
           // no further files in this level will contain data for
@@ -1065,6 +1134,7 @@ uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
           break;
         }
       } else {
+		  //lzh: ikey 落在了 files[i] 范围内，下面进行精确计算，ikey 的偏移
         // "ikey" falls in the range for this table.  Add the
         // approximate offset of "ikey" within the table.
         Table* tableptr;
@@ -1082,7 +1152,8 @@ uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
 
 /************************************************************************/
 /* 
-lzh: 各个 level 上均有一个 versions 列表, 各个 version 有多个文件，取它们的 id 
+lzh: dummy_versions 管理了多个 version，各个 verion 均包含各个 level 上的文件，
+	将这些文件的标记 number 取出放入 live
 */
 /************************************************************************/
 void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
@@ -1105,6 +1176,11 @@ int64_t VersionSet::NumLevelBytes(int level) const {
   return TotalFileSize(current_->files_[level]);
 }
 
+/************************************************************************/
+/* 
+	lzh: 求相邻两层各文件最大的重叠字节数
+*/
+/************************************************************************/
 int64_t VersionSet::MaxNextLevelOverlappingBytes() {
   int64_t result = 0;
   std::vector<FileMetaData*> overlaps;
@@ -1122,6 +1198,11 @@ int64_t VersionSet::MaxNextLevelOverlappingBytes() {
 }
 
 // Store in "*inputs" all files in "level" that overlap [begin,end]
+/************************************************************************/
+/* 
+	lzh: 计算第 level 层的文件的 user_key 与区间 [begin, end] 的 user_key 重叠的文件，放入 inputs
+*/
+/************************************************************************/
 void VersionSet::GetOverlappingInputs(
     int level,
     const InternalKey& begin,
@@ -1145,6 +1226,11 @@ void VersionSet::GetOverlappingInputs(
 // Stores the minimal range that covers all entries in inputs in
 // *smallest, *largest.
 // REQUIRES: inputs is not empty
+/************************************************************************/
+/* 
+	lzh: 获得 inputs 指示的文件集合的键的范围
+*/
+/************************************************************************/
 void VersionSet::GetRange(const std::vector<FileMetaData*>& inputs,
                           InternalKey* smallest,
                           InternalKey* largest) {
@@ -1179,6 +1265,11 @@ void VersionSet::GetRange2(const std::vector<FileMetaData*>& inputs1,
   GetRange(all, smallest, largest);
 }
 
+/************************************************************************/
+/* 
+	lzh: 生成 Compaction 中的 inputs_[0] 和 inputs_[1] 的 Iterator，再将这两个 Iterator 包装成一个 MegeringIterator
+*/
+/************************************************************************/
 Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   ReadOptions options;
   options.verify_checksums = options_->paranoid_checks;
@@ -1191,7 +1282,7 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   const int space = (c->level() == 0 ? 
 		c->inputs_[0].size() + 1	// lzh: 0 层的文件可能相互重叠所以它们每个都需要包装为 Iterator, 另外第 1 层所有文件需要包装为一个 NewTwoLevelIterator
 	  : 
-		2							// lzh: 非第 0 层文件总是有两个文件集合要 compact. c[0], c[1]
+		2							// lzh: 非第 0 层文件总是有两个文件集合要 compact：n 层所有文件和 n+1 层所有文件，分别对应 c[0], c[1]
 	  );
   Iterator** list = new Iterator*[space];
   int num = 0;
@@ -1214,7 +1305,7 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   }
   assert(num <= space);
 
-  //lzh: 将所有的 Iterator 包装为一个
+  //lzh: 将所有的 Iterator 包装为一个 NewMergingIterator
   Iterator* result = NewMergingIterator(&icmp_, list, num);
   delete[] list;
   return result;
@@ -1267,7 +1358,7 @@ Compaction* VersionSet::PickCompaction() {
       }
     }
 
-	//lzh: level 层所有的文件之前都已经 compact 过. 但是本函数仍被调用, 则说明由于某些情况(如本层 size 仍较大, 或触发了 seek_compaction)
+	//lzh: c->inputs_[0].empty() 说明 level 层所有的文件之前都已经 compact 过. 但是本函数仍被调用, 进一步说明由于某些情况(如本层 size 仍较大, 或触发了 seek_compaction)
 	//lzh: 需要再次 compact, 所以从本层第一个文件开始.
     if (c->inputs_[0].empty()) {
       // Wrap-around to the beginning of the key space
@@ -1297,6 +1388,7 @@ Compaction* VersionSet::PickCompaction() {
     assert(!c->inputs_[0].empty());
   }
 
+  //lzh: 找到另外 compact 的输入文件
   SetupOtherInputs(c);
 
   return c;
@@ -1421,8 +1513,12 @@ bool Compaction::IsTrivialMove() const {
   // Avoid a move if there is lots of overlapping grandparent data.
   // Otherwise, the move could create a parent file that will require
   // a very expensive merge later on.
-	//lzh: 避免当前层 level 与 level+2 层有很多键值重叠的 move，否则，继此次 move 
-	//之后，level+1 层后续将会需要一次很高耗费的 move
+  // lzh: compation 输入文件中，若 level 层有一个文件，level+1 层没有文件，则可以直接将这个文件放入 level+1 层中，不会有重叠。
+  // lzh: 但是还存在例外的情况：如果这个文件与 level+2 层有太多的重叠(按 leveldb 预定义，和 level+2 达到多于 10 个文件重叠)
+  // lzh: 则不能将这个文件直接放入 level+1 层中，因为如果后续这个 level+1 层文件发生 compact 的话，我们需要对 level+2 层多于 10 个文件
+  // lzh: 进行 compact，这是很高的耗费。
+  // lzh: 因此，正确的做法是，将这个 level 层的文件在 compact 时，拆分为多个文件放入 level+1 中，使得它们每一个与 level+2 层键重合的文件数量保持最多 10个
+  // lzh: grandparents_  正是 level+2 层文件与当前 compaction 输入文件发生重叠的文件，因此它的大小就代表了这个文件与 level+2 层重叠程度。
   return (num_input_files(0) == 1 &&
           num_input_files(1) == 0 &&
           TotalFileSize(grandparents_) <= kMaxGrandParentOverlapBytes);
@@ -1438,7 +1534,7 @@ void Compaction::AddInputDeletions(VersionEdit* edit) {
 
 /************************************************************************/
 /* 
-	lzh: 判断 user_key 是否只出现在 base level 中(level 或 level+1 层)
+	lzh: 判断 user_key 是否没有出现在 level+2 及之后的层次中 
 */
 /************************************************************************/
 bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
@@ -1476,49 +1572,38 @@ bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
 /************************************************************************/
 /* 
 	lzh: 
-		函数的使用场景是:	在处理 internal_key 之前是否要停止构建当前 compaction 的输出. (将已经构建好的输出到 sst, 再新起一个构建)
-		实现的细节是:		level+2 层的文件中, 所有 key 都比 internal_key 小(即 largest 比它小)的文件的 size 之和
-								达到了一个阈值, 则函数返回 true. 否则 false
+		函数的使用场景是:	决定是否停止将 internal_key 加入到当前 sst 文件中/即当前 sst 文件停止构建，dump 到磁盘 sst 文件。加入到一个新的 sst 文件中. 
+		此函数实际上是决定 compaction 依次遍历到的 internal_key 的排布情况。
 		
-		函数的作用是:		将与 level+2 层相交较多的 internal_key 尽可能地放入同一个文件. 这可以减少 compaction 后生成的 level+1 文件
-								与 level+2 层文件的相交程度.
-							
-		举例说明, 依次传入: a, b, c, d, e, f, g, h, i, j, 注意它们是递增的顺序, 本函数的返回值和函数调用完之后 grandparent_index_ 的值如下表:
+		1.最简单的排布即是按它们的遍历顺序（增序），挨着填满一个一个的 sst 文件：
+			设 compaction 输入文件所有的健值集合区间是 [smallest, largest]，如下，
+			
+			sst1:[smallest, largest1]
+			sst2:[smallest2, largest2]
+			sst3:[smallest3, largest3]
+			...
+			sstn:[smallestn, largest]
 
-			ShouldStopBefore	|	grandparent_index_		|	含义
-			------------------------------------------------------------------------------------------------------------------
-		a		false						0					a <= f[0].largest
-		b		false						1					f[0].largest < b <= f[1].largest
-		c		true						2					f[1].largest < c <= f[2].largest, c 与文件 f[0]和f[1] 的交集程度大于阈值, 从它开始的 key 应该新起一个 sst 存放
-		d		false						2					c < d <= f[2].largest
-		e		true						3					f[2].largest < e <= f[3].largest, e 与文件 f[2] 的交集程度大于阈值
-		f		true						4					f[3].largest < f <= f[4].largest, f 与文件 f[3] 的交集程度大于阈值
-		g		false						4					g <= f[4].largest
-		h		false						5					f[4].largest < h <= f[5].largest
-		i		false						5					i <= f[5].largest
-		j		true						6					i > f[5].largest, j 与文件 f[4]和f[5] 的交集程度大于阈值
+		这有可能导致其中某个 sstx 文件与 level+2 层的较多文件存在键值重叠，若后面发生 compacton 将 sstx 压到 level+2 层，这将涉及到所有相交的 level+2 层文件
+		因此，我们需要缩小每个生成的 sst 文件与 level+2 层的相交程度，这个相交程度由 kMaxGrandParentOverlapBytes 指定。
+
+		2.因此我们在决定是否要将 internal_key 是否放进当前 compaction 输出文件 sst 中，需要参考这个 sst 文件与 level+2层的重叠程度。
+		由于 grandparents_ 表示 level+2 层与当前 comapction 的输入文件键值相交的文件集合，所以可以优化为计算此 sst 文件与 grandparents_ 的重叠程度。
 		
-		上面的例子, 导致的结果是:
-		a, b		---> 1.sst, 与 f[0] 交集较小
-		c, d		---> 2.sst, 与 f[0],f[1] 相交程度大于阈值
-		e			---> 3.sst, 与 f[2] 相交程度大于阈值
-		f, g, h, i	---> 4.sst, 与 f[3] 相交程度大于阈值
-		j			---> 5.sst, 与 f[4],f[5] 相交程度大于阈值
+		计算方法是，累计加入到当前 sst 文件中的所有 internal_key 与 grandparents_ 的重叠 overlapped_bytes_。
+		internal_key 与 grandparents_ 的重叠计算方法是：internal_key 是否跨越了 grandparents_ 中的一个新的文件：使用 grandparent_index_ 来标记。
+		当前若是一个新的 sst 文件，则重置 overlapped_bytes_ 为0，表示新开始一轮统计。
+						
+		
+		seen_key_ 有点意思：整个 compaction 中只有在首次调用时为 false，之后全为 true。
+		
+		假设首个 internal_key 较大：设 internal_key > grandparents_[n]，且 n*SST_SIZE > kMaxGrandParentOverlapBytes，
+		则我们应该中止构建当前 compaction 的 sst 文件：停止将 internal_key 加入，且将 sst 立即写入磁盘，再开始一个新的 sst 构建。
+		然而正因为这个是首个 internal_key，当前构建中的 sst 文件没有加入过任何键值对，将它写入磁盘是毫无意义的。
+		所以，我们使用 seen_key_ 来弥补这个漏洞：只要是首个 internal_key 就将它加入当前的 sst 文件。
 
-		效果很明显, compaction 完成后 1 个 level+1 层的文件与 level+2 层文件相交的总大小是 kMaxGrandParentOverlapBytes.
-		如果 level+2 层文件较小时, 可以与多个 level+2 文件相交, 若较大则只与一个 level+2 文件相交
-		见工程资源图: sst_compaction_should_stop_before
-
-	其它的细节:
-		1.首次调用此函数时 seen_key_ 是 false , 也即一定返回 false, 第二次或之后调用时就一直是 true 了, 根据实际情况返回.
-
-		2.grandparent_index_ 表示在 gradparents_ 中遍历的位置, 每次遍历完之后此值会增加. 
-
-		3.kMaxGrandParentOverlapBytes 控制着 compaction 完成后每个 level+1 层文件与 level+2 层文件相交的总文件大小.
-
-		4.overlapped_bytes_ 指的是当前 compaction 过程处于当前构建中的那一个文件(level+1层), 与 level+2 层相交的那些文件, 其总大小.
-			需要注意的是, 每个新开始构建的文件, overlapped_bytes_ 会归 0.
-
+		但实际上，这是多余的，internal_key 是递增序被遍历的，首个 internal_key 最小，再考虑 grandparents_ 的定义，		
+		首个 internal_key 必然落在 grandparents[0] 这个文件的范围内（如果 grandparents不为空），所以前面的假设不会成立，即那个 n 等于0
 */
 /************************************************************************/
 bool Compaction::ShouldStopBefore(const Slice& internal_key) {

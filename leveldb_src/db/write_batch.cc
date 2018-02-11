@@ -123,6 +123,17 @@ void WriteBatch::Delete(const Slice& key) {
   PutLengthPrefixedSlice(&rep_, key);
 }
 
+
+/************************************************************************/
+/* 
+	lzh: 这是一个适配器类，用于将 WriteBatch 插入到 MemTable 中
+	注意，一个 WriteBatch 拥有一个基本 sequence number，但是这个 batch 内的操作，每一个都
+	拥有一个独立的 sequence number。详见 MemTableInserter::Put 和 MemTableInserter::Delete
+	中会递增 sequence_。
+
+	此逻辑与 DBImpl 中生成一个 WriteBatch 后 sequence number 增加了 WriteBatch.count()，这点要注意到。
+*/
+/************************************************************************/
 namespace {
 class MemTableInserter : public WriteBatch::Handler {
  public:

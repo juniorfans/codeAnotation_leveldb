@@ -201,15 +201,20 @@ void DBImpl::MaybeIgnoreError(Status* s) const {
 
 /************************************************************************/
 /* 
-	这个函数会查找数据库中的所有文件，然后删除不在current log文件中的所有log文件，
-	再删除没有在任何一个level中引用也没有正在压缩的所有table文件.
+	lzh:
+	这个函数会查找数据库中的所有文件：
+	删除较老的 log 文件
+	删除较老的描述文件
+	删除没有在任何一个level中引用也没有正在压缩的所有table文件和对应的 tmp 文件，再从缓存中删除这些 sst 数据
 */
 /************************************************************************/
 void DBImpl::DeleteObsoleteFiles() {
   // Make a set of all of the live files
+	//lzh: 将正在 compaction 和版本管理中的所有 table 文件均加到 live 中：它们是有效的文件
   std::set<uint64_t> live = pending_outputs_;
   versions_->AddLiveFiles(&live);
 
+  //lzh: 遍历数据库目录下的所有文件
   std::vector<std::string> filenames;
   env_->GetChildren(dbname_, &filenames); // Ignoring errors on purpose
   uint64_t number;
@@ -285,14 +290,18 @@ Status DBImpl::Recover(VersionEdit* edit) {
     }
   }
 
+  //lzh: 读取 CURRENT 文件，获得当前的 manifest 文件，再从此文件中获得 versionedit，再通过这些 versionedit 
+  //lzh: 构建出
   s = versions_->Recover();
   if (s.ok()) {
     SequenceNumber max_sequence(0);
 
+	// lzh: 我们从比 descriptor 中的 log 更新的 log 中执行 Recover（因为这些更新的 log 可能被加入到 descriptor 中）
     // Recover from all newer log files than the ones named in the
     // descriptor (new log files may have been added by the previous
     // incarnation without registering them in the descriptor).
-    //
+    
+	// lzh: 虽然 PrevLogNumber() 不会再被使用，但是我们要防止使用隐式地恢复了一个较低版本 db
     // Note that PrevLogNumber() is no longer used, but we pay
     // attention to it in case we are recovering a database
     // produced by an older version of leveldb.
@@ -432,7 +441,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number,
 
 /************************************************************************/
 /* 
-	lzh: 将 mem 写入磁盘, sst 文件的层次即 [min_key, max_key] 首个相交的层次
+	lzh: 将 mem 写入磁盘, 生成的 sst 文件的 level 计算方式是：首个键范围与 [min_key, max_key] 相交的层次
 */
 /************************************************************************/
 Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
@@ -459,12 +468,13 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
       s.ToString().c_str());
   delete iter;
 
-  //lzh: 已经将 meta.number 写入到 sst 中了, 删除之
+  //lzh: 已经将 meta.number 写入到 sst 中了, 删除之	
   pending_outputs_.erase(meta.number);
 
 
   // Note that if file_size is zero, the file has been deleted and
   // should not be added to the manifest.
+  // lzh: 将 meta 这个文件加入到哪一个 level 中, 判断的依据是，meta 的键范围与哪一个 level 的键范围有重叠.
   int level = 0;
   if (s.ok() && meta.file_size > 0) {
 	  //lzh: 由第 0 个 level 开始，找到首个 level，使它里面的 key 落在区间 [min_user_key, max_user_key]
@@ -772,7 +782,16 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
   return s;
 }
 
-
+/************************************************************************/
+/* 
+	lzh:
+		将 compact 中生成的新文件在 VersionEdit 中标记，注意 level 层生成的文件是要加入到 level+1 层中的
+		将 compact 的输入文件(_inputs)在 VersionEdit 中标记
+		删除以后再也不会用到的文件(如果有的话)
+		
+		然后在当前 Version 中应用 VersionEdit
+*/
+/************************************************************************/
 Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   mutex_.AssertHeld();
   Log(options_.info_log,  "Compacted %d@%d + %d@%d files => %lld bytes",
@@ -788,7 +807,7 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     const CompactionState::Output& out = compact->outputs[i];
     compact->compaction->edit()->AddFile(
-        level + 1,
+        level + 1,	//lzh: level 层生成的文件，compaction 生要加入到 level+1 层
         out.number, out.file_size, out.smallest, out.largest);
     pending_outputs_.erase(out.number);
   }
@@ -807,24 +826,39 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   return s;
 }
 
+Iterator* getTestIterator(uint64_t& snapshot)
+{
+	const Comparator* comparator = leveldb::BytewiseComparator();
+	InternalKeyComparator comp(comparator);
+
+	SequenceNumber x16(16),x17(17),x18(18),x19(19);
+	Slice as("a",1);
+	MemTable *mt = new MemTable(comp);
+	mt->Add(x16,ValueType::kTypeValue,as,Slice("x16",3));
+	mt->Add(x18,ValueType::kTypeValue,as,Slice("x18",3));
+	mt->Add(x19,ValueType::kTypeValue,as,Slice("x19",3));
+
+	Iterator* its[1] = {mt->NewIterator()};
+
+	Iterator* megerIt = leveldb::NewMergingIterator(&comp,its,1);
+	snapshot = x17;
+	return megerIt;
+}
+
 /************************************************************************/
 /* 
 	lzh: 压缩挑选出来的 level 层和 level+1 层文件集合: c[0], c[1]
 
-	lzh: 关于后面的 drop 那段, 需要注意的是若一个 user_key 是首次遇到, 即使它的 sequence <= compact, 
-		也不应该被 drop. 比如, 当前的 input 中有以下 w, x, y ,z 四个 internal key, 依据
-		Internal key 的排序规则: user_key 正序比较 --> sequence number 逆序 --> type 的逆序
-
-		w	("2000","second", 5)
-		x	("2000","first", 4)
-		y	("1000","second", 2)
-		z	("1000","first", 1)
-
-		括号内分别是 key - value - sequence. 
-		那么 compact->smallest_snapshot 为 3, 遍历到 x 时, 虽然 sequence 大于 3, 但是 x 显然应该 drop 掉, 而遍历到
-		y 时虽然 sequence 小于 3 但是 y 显然不应该 drop.
-
-		所以使用 last_sequence_for_key 去达到一个效果: 每个相同的 user_key 只保留 sequence 最大的那个
+	leveldb 中的 snapshot 的功能是，
+	Get 时可以通过option传入snapshot参数，那么查找时会跳过SequenceNumber比snapshot大的键值对，定位到小于等于 snapshot 的最新版本，从而完成快照功能：读取历史数据。
+	
+	对应地，compaction 应该有如下两个逻辑：
+		1.为每个 user_key 保留一个小于等于 snapshot 的最大版本号(如果有的话)。
+		2.最基本的，各个 user_key 要保留其最新的版本，不论这个版本是不是小于 snapshot。
+	
+	由1，2两点，当 snapshot 没有被设置时，snapshot 应该被默认为整个 leveldb 中当前最大版本号。此时第1点等于无（此时它即是第2点）。
+	另外，一个解析出错的键值对后面紧挨着的键值对不会被 drop。
+	
 */
 /************************************************************************/
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
@@ -841,10 +875,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(compact->builder == NULL);
   assert(compact->outfile == NULL);
 
-  //lzh: 没有 snapshots_ 的情况下, 当前内存中的最新 sequence 作为 compaton 最小版本号 smallest_snapshot, 这将导致 compation 时所有的 sequence 都比此值小.
-  //lzh: 但是本函数还有一个逻辑: 首将遇到的 user_key 不会被 drop, 此后的(即 sequence 较小的)会被 drop
-  //lzh: 若 snapshots_ 不为空, 相当于人工干预使 smallest_snapshot 更小, 效果是同 user_key 将会有多个版本被留下, 不被 drop
-  //lzh: 这刚好就是 snapshot 的功能 -- 可提供旧数据的读取
+  //lzh: 函数注释已经阐明 snapshot 没有被设置时，应该被设置为 leveldb 中当前最大版本号。
+  //lzh: 若有多个 snapshot 应该使用最小的那个，以保证更古老的版本数据能够被保存下来
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
@@ -854,16 +886,22 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   // Release mutex while we're actually doing the compaction work
   mutex_.Unlock();
 
-  //lzh: 得到遍历所有数据的 Iterator. 它将正序遍历所有的 Internalkey, 排序规则是 (user_key 正序比较 --> sequence number 逆序 --> type 的逆序)
+  //lzh: 得到遍历所有数据的 Iterator. 它将正序遍历所有的 Internalkey，相同的 user_key 越新的版本越前面被遍历到
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
+
+  //input = getTestIterator(compact->smallest_snapshot);
+
   input->SeekToFirst();
   Status status;
   ParsedInternalKey ikey;	//当前正遍历到的 internal key
-  std::string current_user_key;	//上一个遍历的 user key
 
-  //lzh: 遍历 input 的过程中是否遇到了 current_user_key (user key 一样, sequence number 不一样), 我们需要 drop 掉比较旧的 ikey
+  std::string current_user_key;	//当前遍历到的 user_key。
+
+  //lzh: current_user_key 是否有效。还没有开始遍历，或者解析失败时此值为 false
   bool has_current_user_key = false;
-  //lzh: current_user_key 的上一个版本号 sequence
+
+  //lzh: 上一次遍历到的当前 user_key 的 sequence number。
+  //lzh: 还没有开始遍历，或者解析失败时，或者当前的 user_key 是首次遍历到，则此值为 kMaxSequenceNumber。保证每第一次遍历到的 user_key 不被 drop
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
 
   //lzh: 依次遍历, 若不 drop, 则 compact
@@ -900,37 +938,35 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       last_sequence_for_key = kMaxSequenceNumber;
     } else 
 	{
-
-		// lzh: 首次遇到 ikey.user_key
-		// lzh: 判定条件 -- 当前没有遇到 ikey.user_key 或当前的 ikey.user_key 与 current_user_key 不相等
-      if (!has_current_user_key ||
+	  // lzh: 首次遇到 ikey.user_key 这个 user_key
+      if (!has_current_user_key ||	//lzh: !has_current_user_key 表示上一个 ikey 解析失败或者当前是第一次解析
           user_comparator()->Compare(ikey.user_key,
-                                     Slice(current_user_key)) != 0) {
+                                     Slice(current_user_key)) != 0) {	//lzh: 表示当前的 ikey.user_key 与 current_user_key 不相等
         // First occurrence of this user key
 		
         current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
         has_current_user_key = true;
-        last_sequence_for_key = kMaxSequenceNumber;	//当前 user key 的上一个 sequence
+        last_sequence_for_key = kMaxSequenceNumber;	//lzh: 当前 ikey.user_key 是首次遇到，设置 last_sequence_for_key=kMaxSequenceNumber 保证当前 ikey 不被 drop
       }
-
-	  //lzh: 这里有点奇怪: 为什么用 ikey.user_key 的上一个 sequence 来判断当前 ikey 的 drop , 而不是当前的 sequence -- ikey.sequence ?
-	  //lzh: 原因之一, Internal key 的排序规则是: user_key 正序比较 --> sequence number 逆序 --> type 的逆序
-	  //lzh: 所以 ikey.sequence < last_sequence_for_key <= compact->smallest_snapshot
-	  //lzh: 所以当整个 compact 中的最小的 sequence 都比 ikey.sequence 大, 则当前的记录应该被 drop 掉
-	  //lzh: 原因之二, 如果用 ikey.sequence 来判断当前 ikey 的 drop，那么当 ikey.user_key 是第一次被遍历时, 当 ikey.sequence 较小时, ikey 会被 drop，但其实不应该 drop
-
-	  //lzh: 注意此处, last_sequence_for_key 可以小于 compact->smallest_snapshot: 后者可能在此函数的一开头被赋值为 versions_->LastSequence().
-	  //lzh: 而待 compation 的数据可能是 sst 中的数据, 它们的 sequence 必然小于 versions_->LastSequence()
+	  
+	  //lzh: 当前 user_key 的上一个版本 <= snapshot，我们把上一个版本保留下来，以满足 snapshot 的功能：为每个 user_key 保留一个小于等于 snapshot 的最大版本号。
+	  //lzh: 从当前版本开始(包括在内)，后续所有当前 user_key 的更旧版本可以 drop 了。
       if (last_sequence_for_key <= compact->smallest_snapshot) {
         // Hidden by an newer entry for same user key
-		  //lzh: 如果是首次遇到 key, 不会被 drop 掉.
-		  //lzh: 因为首次遇到时 last_sequence_for_key = kMaxSequenceNumber, 该分支不会进入
         drop = true;    // (A)
       } else if (ikey.type == kTypeDeletion &&
                  ikey.sequence <= compact->smallest_snapshot &&
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) 
 	  {
-		  //lzh: 遍历到的当前 key 虽然是较新的, 但是它的 type 是 delete , 并且它的 sequence 较小, 并且这个 user_key 只出现在 level 0 和 1 中
+		  //lzh: 若当前 user_key 上一个版本 > snapshot，但当前 user_key 的 type 是 deletion，那么什么情况下可以 drop 掉这个版本呢？
+		  //lzh: 1.当前是要将 level_ 层和 level_+1 层 compact，如果当前 user_key 出现在比level_+1 层更高的层次，那么这个 kv 必然不能被 drop 掉，
+		  //lzh: 否则，其它层可能存在的更旧的版本就会被使用，这将导致逻辑错误。
+		  //lzh: 2.若当前版本大于数据库设置的最小快照号 smallest_snapshot 仍然将它 drop 掉
+		  //lzh: 注意当前的 user_key 是 deletion 版本，为了保持逻辑的正确性：相同 user_key 的 deletion 版本后面的版本是无效的，还需要将此 user_key 后续版本全部 drop
+		  //lzh: 但是这样一来快照功能的逻辑就错了：我们的查找范围是所有小于等于 snapshot 的版本。因为我们已经删除了所有的较旧版本的 user_key，所以使用快照功能也无法访问了，
+		  //lzh: 虽然在一个较旧的时刻，user_key 最新的版本是有效的，在快照下应该是可访问的。
+		  //lzh: 综上，所以判断的条件有以上三个。
+		  
         // For this user key:
         // (1) there is no data in higher levels
         // (2) data in lower levels will have larger sequence numbers
@@ -941,6 +977,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         drop = true;
       }
 
+	  //lzh: 在赋值之前 last_sequence_for_key 指的是前一次遍历到的当前 user_key 的版本。若当次是首次遍历到当前 user_key 则此值在赋值前为 kMaxSequenceNumber
       last_sequence_for_key = ikey.sequence;
     }
 #if 0
@@ -1088,9 +1125,7 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
 /************************************************************************/
 /* 
 	lzh: 从内存中的 mem, imem, VersionSet (缓存的sst文件/磁盘上的sst文件) 中查找 key
-		若是最后一种情况, 在 VersionSet 中查找时, 需要在多于 1 个文件中查找, 则认为
-		查询的效率比较低, 需要做 compaction 以提高后续查找效率. compaction 的对象是
-		第二个被查找的文件
+		若是最后一种情况，可能会触发 seek_compaction 策略，详见后面注释。
 */
 /************************************************************************/
 Status DBImpl::Get(const ReadOptions& options,
@@ -1200,6 +1235,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   uint64_t last_sequence = versions_->LastSequence();
   if (status.ok()) {
     WriteBatchInternal::SetSequence(updates, last_sequence + 1);
+
+	//lzh: 这一点与 write_batch.cc 中 MemTableInserter 的实现相呼应：batch 中的操作依次获得 last_sequence+i 的 sequence number
     last_sequence += WriteBatchInternal::Count(updates);
 
     // Add to log and apply to memtable.  We can release the lock during
@@ -1402,6 +1439,7 @@ Status DB::Open(const Options& options, const std::string& dbname,
   VersionEdit edit;
   Status s = impl->Recover(&edit); // Handles create_if_missing, error_if_exists
   if (s.ok()) {
+	  //lzh: 获得整个 leveldb 中最大的 file number + 1
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     WritableFile* lfile;
     s = options.env->NewWritableFile(LogFileName(dbname, new_log_number),

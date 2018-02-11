@@ -115,6 +115,14 @@ inline ValueType ExtractValueType(const Slice& internal_key) {
   return static_cast<ValueType>(c);
 }
 
+//lzh: [增加代码] 从 internal key 里面解析出 sequence number
+inline uint64_t ExtractSequenceNumber(const Slice& internal_key) {
+	assert(internal_key.size() >= 8);	//internal_key 的 size = key size  + type size(8)
+	const size_t n = internal_key.size();
+	uint64_t num = DecodeFixed64(internal_key.data() + n - 8);
+	return num >> 8;
+}
+
 // A comparator for internal keys that uses a specified comparator for
 // the user key portion and breaks ties by decreasing sequence number.
 class InternalKeyComparator : public Comparator {
@@ -155,6 +163,10 @@ class InternalKey {
   }
 
   Slice user_key() const { return ExtractUserKey(rep_); }
+
+  uint64_t sequence_number() const { return ExtractSequenceNumber(rep_); }
+
+  ValueType value_type() const{return ExtractValueType(rep_); }
 
   void SetFrom(const ParsedInternalKey& p) {
     rep_.clear();

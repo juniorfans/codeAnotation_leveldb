@@ -95,7 +95,7 @@ class Version {
   class LevelFileNumIterator;
   Iterator* NewConcatenatingIterator(const ReadOptions&, int level) const;
 
-  //lzh: this Version 属于哪个 VersionSet 
+  //lzh: 为了支持 VersionSet 使用双向链表方式实现 Version 集合，Version 内部 必须含有 next_ 和 prev_, vset_ 表示了 this Version 属于哪个集合
   VersionSet* vset_;            // VersionSet to which this Version belongs 
   Version* next_;               // Next version in linked list	//lzh: 下一个
   Version* prev_;               // Previous version in linked list	//lzh: 上一个
@@ -130,6 +130,12 @@ class Version {
   void operator=(const Version&);
 };
 
+
+/************************************************************************/
+/* 
+	VersionSet 如其名：Version 集合。方式是使用双向链表。而 Version 为了支持这一实现，它内部包含了 Next, Prev 指针。
+*/
+/************************************************************************/
 class VersionSet {
  public:
   VersionSet(const std::string& dbname,
@@ -269,8 +275,10 @@ class VersionSet {
   uint64_t prev_log_number_;  // 0 or backing store for memtable being compacted
 
   // Opened lazily
+  //lzh: descriptor_file_ 和 descripor_log_ 实际上是同一个东西，都是 manifest 文件，后者包装了前者。
   WritableFile* descriptor_file_;
   log::Writer* descriptor_log_;
+
   Version dummy_versions_;  // Head of circular doubly-linked list of versions. //lzh: 各个 versions 的双链表的头指针
   Version* current_;        // == dummy_versions_.prev_
 
@@ -342,7 +350,7 @@ class Compaction {
 
   // State used to check for number of of overlapping grandparent files
   // (parent == level_ + 1, grandparent == level_ + 2)
-  // lzh: 指的是 level_ + 2 层
+  // lzh: grandparents_ 指的是 level_ + 2 层
   std::vector<FileMetaData*> grandparents_;
   size_t grandparent_index_;  // Index in grandparent_starts_
   bool seen_key_;             // Some output key has been seen

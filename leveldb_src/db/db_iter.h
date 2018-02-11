@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "leveldb/db.h"
 #include "db/dbformat.h"
+#include "leveldb/slice.h"
 
 namespace leveldb {
 
@@ -22,6 +23,13 @@ extern Iterator* NewDBIterator(
     Iterator* internal_iter,
     const SequenceNumber& sequence);
 
+//lzh: [增加代码]
+extern Slice getInternalKey(Iterator* dbIter);
+
+extern void findNextUserEntry(Iterator* dbIter, bool skipping,std::string* skip);
+
 }
+
+
 
 #endif  // STORAGE_LEVELDB_DB_DB_ITER_H_

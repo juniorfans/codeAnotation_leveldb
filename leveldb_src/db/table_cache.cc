@@ -29,6 +29,18 @@ static void UnrefEntry(void* arg1, void* arg2) {
   cache->Release(h);
 }
 
+
+
+/************************************************************************/
+/* 
+	lzh:
+		TableCache 是一个很有意思的类，它使用 LRUCache 缓存了从 file_number 到
+		文件描述符的对应，同时它限制了最多只能保存 entries 多个这样的映射关系
+
+		而 LRUCahce 在用作 block 缓存具体数据时，则意指缓存的字节数
+*/
+/************************************************************************/
+
 TableCache::TableCache(const std::string& dbname,
                        const Options* options,
                        int entries)
@@ -82,6 +94,9 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
     TableAndFile* tf = new TableAndFile;
     tf->file = file;
     tf->table = table;
+
+	//lzh: 注意下面 Insert 传的参数 charge=1，这是控制只能缓存 entries 个 sst 文件的关键之二，此处与
+	//lzh: 初始化时，传入 entries 是相关的(默认值为 1000-10)
     handle = cache_->Insert(key, tf, 1, &DeleteEntry);
   }
 
